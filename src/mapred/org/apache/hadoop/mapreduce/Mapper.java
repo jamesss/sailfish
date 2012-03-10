@@ -23,6 +23,7 @@ import java.io.IOException;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.RawComparator;
 import org.apache.hadoop.io.compress.CompressionCodec;
+import org.apache.hadoop.mapred.MapTask.MapOutputCollector;
 
 /** 
  * Maps input key/value pairs to a set of intermediate key/value pairs.  
@@ -94,6 +95,9 @@ import org.apache.hadoop.io.compress.CompressionCodec;
  */
 public class Mapper<KEYIN, VALUEIN, KEYOUT, VALUEOUT> {
 
+  org.apache.hadoop.mapred.SailfishMapRunner.SetupHelper sailfishSetupHelper;
+  org.apache.hadoop.mapred.MapTask.MapOutputCollector<KEYOUT,VALUEOUT> collector;
+  
   public class Context 
     extends MapContext<KEYIN,VALUEIN,KEYOUT,VALUEOUT> {
     public Context(Configuration conf, TaskAttemptID taskid,
@@ -132,6 +136,21 @@ public class Mapper<KEYIN, VALUEIN, KEYOUT, VALUEOUT> {
     // NOTHING
   }
   
+  public void setOutputCollector(MapOutputCollector<KEYOUT,VALUEOUT> c) {
+    collector = c;
+  }
+  //!#! Sriram: Add the sailfish setup for mapreduce...set the output collector's outputstream
+  private void sailfishSetup(Context context) throws IOException {
+    sailfishSetupHelper = new org.apache.hadoop.mapred.SailfishMapRunner.SetupHelper();
+    sailfishSetupHelper.setup(context.conf);
+    
+    ((org.apache.hadoop.mapred.SailfishMapCollector<KEYOUT, VALUEOUT>) collector)
+        .setOutputStream(sailfishSetupHelper.iappender.getOutputStream());
+    
+  }
+  public void sailfishClose() throws IOException {
+    sailfishSetupHelper.close();
+  }
   /**
    * Expert users can override this method for more complete control over the
    * execution of the Mapper.
@@ -139,7 +158,20 @@ public class Mapper<KEYIN, VALUEIN, KEYOUT, VALUEOUT> {
    * @throws IOException
    */
   public void run(Context context) throws IOException, InterruptedException {
+    // If there are no reducers, the MapTask.java code doesn't setup the
+    // sailfish collector. In that case, there is no need for Sailfish---since
+    // mapper writes out the output.
+    if ((context.conf.getNumReduceTasks() > 0) &&
+        (context.conf.getBoolean("sailfish.mapred.job.use_ifile", false))) {
+      sailfishSetup(context);
+    }
     setup(context);
+    if (context.conf.get("sailfish.mapred.debug_job.id", null) != null) {
+      // want the mapper to exit straightaway when we are debugging
+      // the map output is in the i-files
+      cleanup(context);
+      return;
+    }
     while (context.nextKeyValue()) {
       map(context.getCurrentKey(), context.getCurrentValue(), context);
     }

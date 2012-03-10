@@ -98,6 +98,7 @@ class ReduceTask extends Task {
   
   private static final Log LOG = LogFactory.getLog(ReduceTask.class.getName());
   private int numMaps;
+  private int reducePartition = -1;  // !#! Added by Sriram
   private ReduceCopier reduceCopier;
 
   private CompressionCodec codec;
@@ -153,6 +154,8 @@ class ReduceTask extends Task {
                     int partition, int numMaps) {
     super(jobFile, taskId, partition);
     this.numMaps = numMaps;
+    this.reducePartition = partition;
+    LOG.info("Setting reducer partition to: " + reducePartition);
   }
   
   private CompressionCodec initCodec() {
@@ -169,6 +172,10 @@ class ReduceTask extends Task {
   @Override
   public TaskRunner createRunner(TaskTracker tracker, TaskInProgress tip) 
   throws IOException {
+    if (reducePartition < 0) {
+      this.reducePartition = tip.getTask().getPartition();
+      LOG.info("Reducer partition is: " + reducePartition);
+    }
     return new ReduceTaskRunner(tip, tracker, this.conf);
   }
 
@@ -342,6 +349,9 @@ class ReduceTask extends Task {
     this.umbilical = umbilical;
     job.setBoolean("mapred.skip.on", isSkipping());
 
+    // if we aren't using I-files, then it is stock hadoop; copy/sort phase exist
+    // and we report progress on those
+    boolean copySortPhaseExist = ! job.getBoolean("sailfish.mapred.job.use_ifile", false);
     if (isMapOrReduce()) {
       copyPhase = getProgress().addPhase("copy");
       sortPhase  = getProgress().addPhase("sort");
@@ -373,7 +383,9 @@ class ReduceTask extends Task {
     boolean isLocal = "local".equals(job.get("mapred.job.tracker", "local"));
     if (!isLocal) {
       reduceCopier = new ReduceCopier(umbilical, job, reporter);
-      if (!reduceCopier.fetchOutputs()) {
+      // Sriram: if we are doing I-files, there is no need to copy any
+      // data from the mappers.  Just move on...
+      if (copySortPhaseExist && (!reduceCopier.fetchOutputs())) {
         if(reduceCopier.mergeThrowable instanceof FSError) {
           throw (FSError)reduceCopier.mergeThrowable;
         }
@@ -381,9 +393,12 @@ class ReduceTask extends Task {
             " - The reduce copier failed", reduceCopier.mergeThrowable);
       }
     }
-    copyPhase.complete();                         // copy is already complete
-    setPhase(TaskStatus.Phase.SORT);
-    statusUpdate(umbilical);
+    
+    if (copySortPhaseExist) {
+      copyPhase.complete();                         // copy is already complete
+      setPhase(TaskStatus.Phase.SORT);
+      statusUpdate(umbilical);
+    }
 
     final FileSystem rfs = FileSystem.getLocal(job).getRaw();
     RawKeyValueIterator rIter = isLocal
@@ -397,9 +412,12 @@ class ReduceTask extends Task {
     // free up the data structures
     mapOutputFilesOnDisk.clear();
     
-    sortPhase.complete();                         // sort is complete
+    if (copySortPhaseExist) {
+      sortPhase.complete();                         // sort is complete
+    }
     setPhase(TaskStatus.Phase.REDUCE); 
     statusUpdate(umbilical);
+
     Class keyClass = job.getMapOutputKeyClass();
     Class valueClass = job.getMapOutputValueClass();
     RawComparator comparator = job.getOutputValueGroupingComparator();
@@ -444,29 +462,57 @@ class ReduceTask extends Task {
         }
       };
     
+      if (job.getBoolean("sailfish.mapred.job.disable_reduce", false)) {
+        LOG.info("Reduce is disabled; we are done!");
+        reducer.close();
+        out.close(reporter);
+        return;
+      }
     // apply reduce function
     try {
       //increment processed counter only if skipping feature is enabled
       boolean incrProcCount = SkipBadRecords.getReducerMaxSkipGroups(job)>0 &&
         SkipBadRecords.getAutoIncrReducerProcCount(job);
       
-      ReduceValuesIterator<INKEY,INVALUE> values = isSkipping() ? 
-          new SkippingReduceValuesIterator<INKEY,INVALUE>(rIter, 
-              comparator, keyClass, valueClass, 
-              job, reporter, umbilical) :
-          new ReduceValuesIterator<INKEY,INVALUE>(rIter, 
-          job.getOutputValueGroupingComparator(), keyClass, valueClass, 
-          job, reporter);
-      values.informReduceProgress();
-      while (values.more()) {
-        reduceInputKeyCounter.increment(1);
-        reducer.reduce(values.getKey(), values, collector, reporter);
-        if(incrProcCount) {
-          reporter.incrCounter(SkipBadRecords.COUNTER_GROUP, 
-              SkipBadRecords.COUNTER_REDUCE_PROCESSED_GROUPS, 1);
+      if (job.getBoolean("sailfish.mapred.job.use_ifile", false)) {
+        if (reducePartition < 0) {
+          reducePartition = getPartition();
+          LOG.info("Our reduce partition is: " + reducePartition);
         }
-        values.nextKey();
-        values.informReduceProgress();
+        // reset the progress so that we actually track when we get records
+        reducePhase.set((float) 0.0);
+        reporter.progress();
+        SailfishReduceHelper.SailfishReduceValuesIterator<INKEY,INVALUE> values = 
+            new SailfishReduceHelper.SailfishReduceValuesIterator<INKEY, INVALUE>(
+                reducePartition, comparator, keyClass, valueClass, job, 
+                reporter, reducePhase, reduceInputValueCounter);
+
+            values.informReduceProgress();
+            while (values.more()) {
+              reduceInputKeyCounter.increment(1);
+              reducer.reduce(values.getKey(), values, collector, reporter);
+              values.nextKey();
+              values.informReduceProgress();
+            }
+      } else {
+        ReduceValuesIterator<INKEY,INVALUE> values = isSkipping() ? 
+            new SkippingReduceValuesIterator<INKEY,INVALUE>(rIter, 
+                comparator, keyClass, valueClass, 
+                job, reporter, umbilical) :
+                  new ReduceValuesIterator<INKEY,INVALUE>(rIter, 
+                      job.getOutputValueGroupingComparator(), keyClass, valueClass, 
+                      job, reporter);
+            values.informReduceProgress();
+            while (values.more()) {
+              reduceInputKeyCounter.increment(1);
+              reducer.reduce(values.getKey(), values, collector, reporter);
+              if(incrProcCount) {
+                reporter.incrCounter(SkipBadRecords.COUNTER_GROUP, 
+                    SkipBadRecords.COUNTER_REDUCE_PROCESSED_GROUPS, 1);
+              }
+              values.nextKey();
+              values.informReduceProgress();
+            }
       }
 
       //Clean up: repeated in catch block below
@@ -543,6 +589,45 @@ class ReduceTask extends Task {
         return ret;
       }
     };
+    if (job.getBoolean("sailfish.mapred.job.use_ifile", false)) {
+      if (reducePartition < 0) {
+        reducePartition = getPartition();
+        LOG.info("Our reduce partition is: " + reducePartition);
+      }
+      // reset the progress so that we actually track when we get records
+      reducePhase.set((float) 0.0);
+      reporter.progress();
+      final SailfishReduceHelper.SailfishNewReduceValuesIterator<INKEY,INVALUE> values = 
+          new SailfishReduceHelper.SailfishNewReduceValuesIterator<INKEY, INVALUE>(
+              reducePartition, comparator, keyClass, valueClass, job, 
+              reporter, reducePhase, reduceInputValueCounter);
+
+      values.informReduceProgress();
+      rIter = new RawKeyValueIterator() {
+        public void close() throws IOException {
+          values.close();
+        }
+        public DataInputBuffer getKey() throws IOException {
+          // LOG.info("Obtaining key input buffer from sf");
+          return values.getKeyInputBuffer();
+        }
+
+        public DataInputBuffer getValue() throws IOException {
+          // LOG.info("Obtaining value input buffer from sf");
+          return values.getValueInputBuffer();
+        }
+        // Called when we need to move to next key
+        public boolean next() throws IOException {
+          values.getNextKV();
+          values.informReduceProgress();
+          return values.hasNext();
+        }
+        @Override
+        public Progress getProgress() {
+          return values.getProgress();
+        }
+      };
+    }
     // make a task context so we can get the classes
     org.apache.hadoop.mapreduce.TaskAttemptContext taskContext =
       new org.apache.hadoop.mapreduce.TaskAttemptContext(job, getTaskID());

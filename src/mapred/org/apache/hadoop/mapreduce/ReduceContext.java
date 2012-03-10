@@ -26,9 +26,11 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.DataInputBuffer;
 import org.apache.hadoop.io.RawComparator;
+import org.apache.hadoop.io.WritableComparator;
 import org.apache.hadoop.io.serializer.Deserializer;
 import org.apache.hadoop.io.serializer.SerializationFactory;
 import org.apache.hadoop.mapred.RawKeyValueIterator;
+import org.apache.hadoop.mapred.SailfishSerialization;
 import org.apache.hadoop.util.Progressable;
 
 /**
@@ -56,6 +58,7 @@ public class ReduceContext<KEYIN,VALUEIN,KEYOUT,VALUEOUT>
   private BytesWritable currentRawKey = new BytesWritable();
   private ValueIterable iterable = new ValueIterable();
 
+  @SuppressWarnings("unchecked")
   public ReduceContext(Configuration conf, TaskAttemptID taskid,
                        RawKeyValueIterator input, 
                        Counter inputKeyCounter,
@@ -71,13 +74,68 @@ public class ReduceContext<KEYIN,VALUEIN,KEYOUT,VALUEOUT>
     this.input = input;
     this.inputKeyCounter = inputKeyCounter;
     this.inputValueCounter = inputValueCounter;
-    this.comparator = comparator;
+    
     SerializationFactory serializationFactory = new SerializationFactory(conf);
-    this.keyDeserializer = serializationFactory.getDeserializer(keyClass);
+    
+    if (conf.getBoolean("sailfish.mapred.job.use_ifile", false)) {
+      @SuppressWarnings("rawtypes")
+      SailfishSerialization sfs = new SailfishSerialization();
+      this.keyDeserializer = (Deserializer<KEYIN>) sfs.getDeserializer(keyClass);
+      this.comparator = SailfishSerialization.isPigKeyClass(keyClass)
+        ? new Pigcmp()
+        : new Memcmp();
+    } else {
+      this.keyDeserializer = serializationFactory.getDeserializer(keyClass);
+      this.comparator = comparator;
+    }
     this.keyDeserializer.open(buffer);
     this.valueDeserializer = serializationFactory.getDeserializer(valueClass);
     this.valueDeserializer.open(buffer);
     hasMore = input.next();
+  }
+
+  private class Pigcmp implements RawComparator<KEYIN> {
+    @Override
+    public int compare(byte[] b1, int s1, int l1, byte[] b2, int s2, int l2) {
+      if (b1[0] == 0 && b2[0] == 0) {
+        // both non-null; ignore index byte
+        return WritableComparator.compareBytes(b1, s1, l1 - 1, b2, s2, l2 - 1);
+      }
+      if (b1[0] != 0 && b2[0] != 0) {
+        // both null; compare by index
+        final byte idxSpace = 0x7F;
+        if ((b1[1] & idxSpace) < (b2[1] & idxSpace)) return -1;
+        else if ((b1[1] & idxSpace) > (b2[1] & idxSpace)) return 1;
+        else return 0;
+      }
+      if (b1[0] != 0) {
+        return -1;
+      }
+      return 1;
+    }
+    @Override
+    public int compare(KEYIN k1, KEYIN k2) {
+      throw new UnsupportedOperationException("Internal error");
+    }
+    @Override
+    public boolean equals(Object o) {
+      throw new UnsupportedOperationException("Internal error");
+    }
+  }
+  
+  private class Memcmp implements RawComparator<KEYIN> {
+    @Override
+    public int compare(byte[] b1, int s1, int l1, byte[] b2, int s2, int l2) {
+      return WritableComparator.compareBytes(b1, s1, l1, b2, s2, l2);
+    }
+    @Override
+    public int compare(KEYIN k1, KEYIN k2) {
+      throw new UnsupportedOperationException("Internal error");
+    }
+    @Override
+    public boolean equals(Object o) {
+      throw new UnsupportedOperationException("Internal error");
+    }
   }
 
   /** Start processing next unique key. */

@@ -124,10 +124,11 @@ class JSPUtil {
       sb.append("<td><b>Name</b></td>");
       sb.append("<td><b>Map % Complete</b></td>");
       sb.append("<td><b>Map Total</b></td>");
-      sb.append("<td><b>Maps Completed</b></td>");
+      sb.append("<td><b>Maps Failed</b></td>");
       sb.append("<td><b>Reduce % Complete</b></td>");
       sb.append("<td><b>Reduce Total</b></td>");
-      sb.append("<td><b>Reduces Completed</b></td>");
+      sb.append("<td><b>Reduces Failed</b></td>");
+      sb.append("<td><b>Job Run-time</b></td>");
       sb.append("<td><b>Job Scheduling Information</b></td>");
       sb.append("</tr>\n");
       for (Iterator<JobInProgress> it = jobs.iterator(); it.hasNext(); ++rowId) {
@@ -136,6 +137,7 @@ class JSPUtil {
         JobStatus status = job.getStatus();
         JobID jobid = profile.getJobID();
 
+        int runState = status.getRunState();
         int desiredMaps = job.desiredMaps();
         int desiredReduces = job.desiredReduces();
         int completedMaps = job.finishedMaps();
@@ -143,6 +145,13 @@ class JSPUtil {
         String name = profile.getJobName();
         String jobpri = job.getPriority().toString();
         String schedulingInfo = job.getStatus().getSchedulingInfo();
+        String jobRunTime;
+        if (runState == JobStatus.RUNNING)
+          jobRunTime = StringUtils.formatTimeDiff(
+              System.currentTimeMillis(), job.getStartTime());
+        else /* failed/killed/succeeded */
+          jobRunTime = StringUtils.formatTimeDiff(
+              job.getFinishTime(), job.getStartTime());
 
         if (isModifiable) {
           sb.append("<tr><td><input TYPE=\"checkbox\" " +
@@ -161,11 +170,14 @@ class JSPUtil {
             + "\">" + ("".equals(name) ? "&nbsp;" : name) + "</td>" + "<td>"
             + StringUtils.formatPercent(status.mapProgress(), 2)
             + ServletUtil.percentageGraph(status.mapProgress() * 100, 80)
-            + "</td><td>" + desiredMaps + "</td><td>" + completedMaps
+            + "</td><td>" + completedMaps + " / " + desiredMaps 
+            + "</td><td>" + job.getNumFailedMapTasks() 
             + "</td><td>"
             + StringUtils.formatPercent(status.reduceProgress(), 2)
             + ServletUtil.percentageGraph(status.reduceProgress() * 100, 80)
-            + "</td><td>" + desiredReduces + "</td><td> " + completedReduces 
+            + "</td><td>" + completedReduces + " / " + desiredReduces  
+            + "</td><td>" + job.getNumFailedReduceTasks() 
+            + "</td><td>" + jobRunTime
             + "</td><td>" + schedulingInfo
             + "</td></tr>\n");
       }

@@ -101,4 +101,9 @@ public abstract class TaskInputOutputContext<KEYIN,VALUEIN,KEYOUT,VALUEOUT>
   public OutputCommitter getOutputCommitter() {
     return committer;
   }
+  
+  //!#! Sriram: Add the sailfish setup for mapreduce
+  public RecordWriter<KEYOUT,VALUEOUT> getRecordWriter() {
+    return output;
+  }
 }
