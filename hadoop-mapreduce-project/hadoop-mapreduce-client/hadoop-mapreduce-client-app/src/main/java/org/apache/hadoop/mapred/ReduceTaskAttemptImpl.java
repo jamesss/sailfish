@@ -43,9 +43,11 @@ public class ReduceTaskAttemptImpl extends TaskAttemptImpl {
       int numMapTasks, JobConf conf,
       TaskAttemptListener taskAttemptListener, OutputCommitter committer,
       Token<JobTokenIdentifier> jobToken,
-      Collection<Token<? extends TokenIdentifier>> fsTokens, Clock clock) {
+      Collection<Token<? extends TokenIdentifier>> fsTokens, Clock clock,
+      int workbuilder_port) {
     super(id, attempt, eventHandler, taskAttemptListener, jobFile, partition,
-        conf, new String[] {}, committer, jobToken, fsTokens, clock);
+        conf, new String[] {}, committer, jobToken, fsTokens, clock,
+        workbuilder_port);
     this.numMapTasks = numMapTasks;
   }
 

@@ -44,10 +44,11 @@ public class MapTaskAttemptImpl extends TaskAttemptImpl {
       int partition, TaskSplitMetaInfo splitInfo, JobConf conf,
       TaskAttemptListener taskAttemptListener, 
       OutputCommitter committer, Token<JobTokenIdentifier> jobToken,
-      Collection<Token<? extends TokenIdentifier>> fsTokens, Clock clock) {
+      Collection<Token<? extends TokenIdentifier>> fsTokens, Clock clock,
+      int workbuilder_port) {
     super(taskId, attempt, eventHandler, 
         taskAttemptListener, jobFile, partition, conf, splitInfo.getLocations(),
-        committer, jobToken, fsTokens, clock);
+        committer, jobToken, fsTokens, clock, workbuilder_port);
     this.splitInfo = splitInfo;
   }
 

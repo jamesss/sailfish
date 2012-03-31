@@ -38,6 +38,10 @@ public enum JobEventType {
   //Producer:Job
   JOB_COMPLETED,
 
+  //Producer:Sailfish
+  JOB_SET_REDUCES,
+  JOB_SET_WORKBUILDER_PORT,
+
   //Producer:Any component
   JOB_DIAGNOSTIC_UPDATE,
   INTERNAL_ERROR,

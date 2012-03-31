@@ -438,6 +438,7 @@ public abstract class TaskAttemptImpl implements
   private WrappedJvmID jvmID;
   private ContainerToken containerToken;
   private Resource assignedCapability;
+  private final int workbuilder_port;
   
   //this takes good amount of memory ~ 30KB. Instantiate it lazily
   //and make it null once task is launched.
@@ -454,7 +455,8 @@ public abstract class TaskAttemptImpl implements
       TaskAttemptListener taskAttemptListener, Path jobFile, int partition,
       JobConf conf, String[] dataLocalHosts, OutputCommitter committer,
       Token<JobTokenIdentifier> jobToken,
-      Collection<Token<? extends TokenIdentifier>> fsTokens, Clock clock) {
+      Collection<Token<? extends TokenIdentifier>> fsTokens, Clock clock,
+      int workbuilder_port) {
     oldJobId = TypeConverter.fromYarn(taskId.getJobId());
     this.conf = conf;
     this.clock = clock;
@@ -462,6 +464,7 @@ public abstract class TaskAttemptImpl implements
     attemptId.setTaskId(taskId);
     attemptId.setId(i);
     this.taskAttemptListener = taskAttemptListener;
+    this.workbuilder_port = workbuilder_port;
 
     // Initialize reportedStatus
     reportedStatus = new TaskAttemptStatus();
@@ -544,7 +547,8 @@ public abstract class TaskAttemptImpl implements
       Map<ApplicationAccessType, String> applicationACLs, Configuration conf,
       Token<JobTokenIdentifier> jobToken,
       final org.apache.hadoop.mapred.JobID oldJobId,
-      Collection<Token<? extends TokenIdentifier>> fsTokens) {
+      Collection<Token<? extends TokenIdentifier>> fsTokens,
+      int workbuilder_port) {
 
     // Application resources
     Map<String, LocalResource> localResources = 
@@ -657,6 +661,11 @@ public abstract class TaskAttemptImpl implements
             MRJobConfig.MAPRED_ADMIN_USER_ENV, 
             MRJobConfig.DEFAULT_MAPRED_ADMIN_USER_ENV)
         );
+    
+    // !#!
+    environment.put(
+        "SAILFISH_WORKBUILDER_PORT", String.valueOf(workbuilder_port));
+    LOG.info("Setting sailfish workbuilder port: " + workbuilder_port);
 
     // Construct the actual Container
     // The null fields are per-container and will be constructed for each
@@ -676,12 +685,14 @@ public abstract class TaskAttemptImpl implements
       final org.apache.hadoop.mapred.JobID oldJobId,
       Resource assignedCapability, WrappedJvmID jvmID,
       TaskAttemptListener taskAttemptListener,
-      Collection<Token<? extends TokenIdentifier>> fsTokens) {
+      Collection<Token<? extends TokenIdentifier>> fsTokens,
+      int workbuilder_port) {
 
     synchronized (commonContainerSpecLock) {
       if (commonContainerSpec == null) {
         commonContainerSpec = createCommonContainerLaunchContext(
-            applicationACLs, conf, jobToken, oldJobId, fsTokens);
+            applicationACLs, conf, jobToken, oldJobId, fsTokens,
+            workbuilder_port);
       }
     }
 
@@ -1119,7 +1130,8 @@ public abstract class TaskAttemptImpl implements
           taskAttempt.conf, taskAttempt.jobToken, taskAttempt.remoteTask,
           taskAttempt.oldJobId, taskAttempt.assignedCapability,
           taskAttempt.jvmID, taskAttempt.taskAttemptListener,
-          taskAttempt.fsTokens);
+          taskAttempt.fsTokens,
+          taskAttempt.workbuilder_port);
       taskAttempt.eventHandler.handle(new ContainerRemoteLaunchEvent(
           taskAttempt.attemptId, taskAttempt.containerID,
           taskAttempt.containerMgrAddress, taskAttempt.containerToken,

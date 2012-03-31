@@ -65,7 +65,7 @@ public class ReduceTaskImpl extends TaskImpl {
     return new ReduceTaskAttemptImpl(getID(), nextAttemptNumber,
         eventHandler, jobFile,
         partition, numMapTasks, conf, taskAttemptListener,
-        committer, jobToken, fsTokens, clock);
+        committer, jobToken, fsTokens, clock, workbuilder_port);
   }
 
   @Override

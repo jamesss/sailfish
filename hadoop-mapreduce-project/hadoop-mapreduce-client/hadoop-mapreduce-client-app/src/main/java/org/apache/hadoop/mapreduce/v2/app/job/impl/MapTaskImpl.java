@@ -67,7 +67,7 @@ public class MapTaskImpl extends TaskImpl {
     return new MapTaskAttemptImpl(getID(), nextAttemptNumber,
         eventHandler, jobFile,
         partition, taskSplitMetaInfo, conf, taskAttemptListener,
-        committer, jobToken, fsTokens, clock);
+        committer, jobToken, fsTokens, clock, workbuilder_port);
   }
 
   @Override

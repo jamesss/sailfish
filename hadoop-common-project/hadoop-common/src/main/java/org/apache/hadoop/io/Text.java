@@ -216,6 +216,7 @@ public class Text extends BinaryComparable
    * @param start the first position of the new string
    * @param len the number of bytes of the new string
    */
+  @Override
   public void set(byte[] utf8, int start, int len) {
     setCapacity(len, false);
     System.arraycopy(utf8, start, bytes, 0, len);

@@ -69,6 +69,7 @@ public class ReduceTask extends Task {
   }
   
   private static final Log LOG = LogFactory.getLog(ReduceTask.class.getName());
+  private int reducePartition = -1;  // !#! Added by Sriram
   private int numMaps;
 
   private CompressionCodec codec;
@@ -312,6 +313,10 @@ public class ReduceTask extends Task {
     throws IOException, InterruptedException, ClassNotFoundException {
     job.setBoolean(JobContext.SKIP_RECORDS, isSkipping());
 
+    // if we aren't using I-files, then it is stock hadoop; copy/sort phase exist
+    // and we report progress on those
+    boolean copySortPhaseExist = ! job.getBoolean("sailfish.mapred.job.use_ifile", false);
+    
     if (isMapOrReduce()) {
       copyPhase = getProgress().addPhase("copy");
       sortPhase  = getProgress().addPhase("sort");
@@ -352,14 +357,17 @@ public class ReduceTask extends Task {
       isLocal = true;
     }
     
-    if (!isLocal) {
-      Class combinerClass = conf.getCombinerClass();
-      CombineOutputCollector combineCollector = 
-        (null != combinerClass) ? 
- 	     new CombineOutputCollector(reduceCombineOutputCounter, reporter, conf) : null;
+    if (job.getBoolean("sailfish.mapred.job.use_ifile", false)) { // !#! Sriram: take out shuffle for Sailfish 
+      rIter = null;
+    } else {
+      if (!isLocal) {
+        Class combinerClass = conf.getCombinerClass();
+        CombineOutputCollector combineCollector = 
+          (null != combinerClass) ? 
+              new CombineOutputCollector(reduceCombineOutputCounter, reporter, conf) : null;
 
-      Shuffle shuffle = 
-        new Shuffle(getTaskID(), job, FileSystem.getLocal(job), umbilical, 
+              Shuffle shuffle = 
+                new Shuffle(getTaskID(), job, FileSystem.getLocal(job), umbilical, 
                     super.lDirAlloc, reporter, codec, 
                     combinerClass, combineCollector, 
                     spilledRecordsCounter, reduceCombineInputCounter,
@@ -368,24 +376,28 @@ public class ReduceTask extends Task {
                     mergedMapOutputsCounter,
                     taskStatus, copyPhase, sortPhase, this,
                     mapOutputFile);
-      rIter = shuffle.run();
-    } else {
-      // local job runner doesn't have a copy phase
-      copyPhase.complete();
-      final FileSystem rfs = FileSystem.getLocal(job).getRaw();
-      rIter = Merger.merge(job, rfs, job.getMapOutputKeyClass(),
-                           job.getMapOutputValueClass(), codec, 
-                           getMapFiles(rfs, true),
-                           !conf.getKeepFailedTaskFiles(), 
-                           job.getInt(JobContext.IO_SORT_FACTOR, 100),
-                           new Path(getTaskID().toString()), 
-                           job.getOutputKeyComparator(),
-                           reporter, spilledRecordsCounter, null, null);
+              rIter = shuffle.run();
+      } else {
+        // local job runner doesn't have a copy phase
+        copyPhase.complete();
+        final FileSystem rfs = FileSystem.getLocal(job).getRaw();
+        rIter = Merger.merge(job, rfs, job.getMapOutputKeyClass(),
+            job.getMapOutputValueClass(), codec, 
+            getMapFiles(rfs, true),
+            !conf.getKeepFailedTaskFiles(), 
+            job.getInt(JobContext.IO_SORT_FACTOR, 100),
+            new Path(getTaskID().toString()), 
+            job.getOutputKeyComparator(),
+            reporter, spilledRecordsCounter, null, null);
+      }
     }
+    
     // free up the data structures
     mapOutputFilesOnDisk.clear();
     
-    sortPhase.complete();                         // sort is complete
+    if (copySortPhaseExist) {
+      sortPhase.complete();                         // sort is complete
+    }
     setPhase(TaskStatus.Phase.REDUCE); 
     statusUpdate(umbilical);
     Class keyClass = job.getMapOutputKeyClass();
@@ -434,26 +446,46 @@ public class ReduceTask extends Task {
       //increment processed counter only if skipping feature is enabled
       boolean incrProcCount = SkipBadRecords.getReducerMaxSkipGroups(job)>0 &&
         SkipBadRecords.getAutoIncrReducerProcCount(job);
-      
-      ReduceValuesIterator<INKEY,INVALUE> values = isSkipping() ? 
-          new SkippingReduceValuesIterator<INKEY,INVALUE>(rIter, 
-              comparator, keyClass, valueClass, 
-              job, reporter, umbilical) :
-          new ReduceValuesIterator<INKEY,INVALUE>(rIter, 
-          job.getOutputValueGroupingComparator(), keyClass, valueClass, 
-          job, reporter);
-      values.informReduceProgress();
-      while (values.more()) {
-        reduceInputKeyCounter.increment(1);
-        reducer.reduce(values.getKey(), values, collector, reporter);
-        if(incrProcCount) {
-          reporter.incrCounter(SkipBadRecords.COUNTER_GROUP, 
-              SkipBadRecords.COUNTER_REDUCE_PROCESSED_GROUPS, 1);
+      if (job.getBoolean("sailfish.mapred.job.use_ifile", false)) {
+        if (reducePartition < 0) {
+          reducePartition = getPartition();
+          LOG.info("Our reduce partition is: " + reducePartition);
         }
-        values.nextKey();
-        values.informReduceProgress();
-      }
+        // reset the progress so that we actually track when we get records
+        reducePhase.set((float) 0.0);
+        reporter.progress();
+        SailfishReduceHelper.SailfishReduceValuesIterator<INKEY,INVALUE> values = 
+            new SailfishReduceHelper.SailfishReduceValuesIterator<INKEY, INVALUE>(
+                reducePartition, comparator, keyClass, valueClass, job, 
+                reporter, reducePhase, reduceInputValueCounter);
 
+            values.informReduceProgress();
+            while (values.more()) {
+              reduceInputKeyCounter.increment(1);
+              reducer.reduce(values.getKey(), values, collector, reporter);
+              values.nextKey();
+              values.informReduceProgress();
+            }
+      } else {
+        ReduceValuesIterator<INKEY,INVALUE> values = isSkipping() ? 
+            new SkippingReduceValuesIterator<INKEY,INVALUE>(rIter, 
+                comparator, keyClass, valueClass, 
+                job, reporter, umbilical) :
+                  new ReduceValuesIterator<INKEY,INVALUE>(rIter, 
+                      job.getOutputValueGroupingComparator(), keyClass, valueClass, 
+                      job, reporter);
+            values.informReduceProgress();
+            while (values.more()) {
+              reduceInputKeyCounter.increment(1);
+              reducer.reduce(values.getKey(), values, collector, reporter);
+              if(incrProcCount) {
+                reporter.incrCounter(SkipBadRecords.COUNTER_GROUP, 
+                    SkipBadRecords.COUNTER_REDUCE_PROCESSED_GROUPS, 1);
+              }
+              values.nextKey();
+              values.informReduceProgress();
+            }
+      }
       //Clean up: repeated in catch block below
       reducer.close();
       out.close(reporter);

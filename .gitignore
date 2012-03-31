@@ -9,3 +9,5 @@
 target
 hadoop-hdfs-project/hadoop-hdfs/downloads
 hadoop-hdfs-project/hadoop-hdfs-httpfs/downloads
+hadoop-common-project/hadoop-common/api/
+hadoop-hdfs-project/hadoop-hdfs/api/

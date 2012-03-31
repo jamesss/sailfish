@@ -39,6 +39,11 @@ public abstract class BinaryComparable implements Comparable<BinaryComparable> {
    */
   public abstract byte[] getBytes();
 
+
+  public void set(byte[] b, int offset, int length) {
+    throw new UnsupportedOperationException("Not implemented");
+  }
+
   /**
    * Compare bytes from {#getBytes()}.
    * @see org.apache.hadoop.io.WritableComparator#compareBytes(byte[],int,int,byte[],int,int)

@@ -18,8 +18,12 @@
 
 package org.apache.hadoop.mapreduce.v2.app.job.impl;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -78,6 +82,8 @@ import org.apache.hadoop.mapreduce.v2.app.job.event.JobDiagnosticsUpdateEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.JobEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.JobEventType;
 import org.apache.hadoop.mapreduce.v2.app.job.event.JobFinishEvent;
+import org.apache.hadoop.mapreduce.v2.app.job.event.JobSetNumReducesEvent;
+import org.apache.hadoop.mapreduce.v2.app.job.event.JobSetWorkbuilderPortEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.JobTaskAttemptCompletedEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.JobTaskAttemptFetchFailureEvent;
 import org.apache.hadoop.mapreduce.v2.app.job.event.JobTaskEvent;
@@ -160,6 +166,11 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
     // of uber-AM attempts (probably sent from MRAppMaster).
   public JobConf conf;
 
+  // !#! Sailfish
+  private Process workbuilder;
+  private int workbuilder_port = -1;
+  private int http_port = -1;
+
   //fields initialized in init
   private FileSystem fs;
   private Path remoteJobSubmitDir;
@@ -185,6 +196,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
           new TaskAttemptCompletedEventTransition();
   private static final CounterUpdateTransition COUNTER_UPDATE_TRANSITION =
       new CounterUpdateTransition();
+  //private static final JobSetWorkbuilderTransition
+  //    SET_WORKBUILDER_TRANSITION = new JobSetWorkbuilderTransition();
 
   protected static final
     StateMachineFactory<JobImpl, JobState, JobEventType, JobEvent> 
@@ -225,6 +238,10 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
           .addTransition(JobState.INITED, JobState.ERROR,
               JobEventType.INTERNAL_ERROR,
               INTERNAL_ERROR_TRANSITION)
+          // unused
+          //.addTransition(JobState.INITED, JobState.INITED,
+          //    JobEventType.JOB_SET_WORKBUILDER_PORT,
+          //    SET_WORKBUILDER_TRANSITION)
 
           // Transitions from RUNNING state
           .addTransition(JobState.RUNNING, JobState.RUNNING,
@@ -257,6 +274,11 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
               JobState.RUNNING,
               JobState.ERROR, JobEventType.INTERNAL_ERROR,
               INTERNAL_ERROR_TRANSITION)
+          .addTransition(
+              JobState.RUNNING,
+              JobState.RUNNING,
+              JobEventType.JOB_SET_REDUCES,
+              new JobSetNumReducesTransition())
 
           // Transitions from KILL_WAIT state.
           .addTransition
@@ -331,6 +353,7 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
           .addTransition(
               JobState.ERROR,
               JobState.ERROR,
+              // EnumSet.allOf(JobEventType.class) ?
               EnumSet.of(JobEventType.JOB_INIT,
                   JobEventType.JOB_KILL,
                   JobEventType.JOB_TASK_COMPLETED,
@@ -338,7 +361,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
                   JobEventType.JOB_MAP_TASK_RESCHEDULED,
                   JobEventType.JOB_DIAGNOSTIC_UPDATE,
                   JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
-                  JobEventType.INTERNAL_ERROR))
+                  JobEventType.INTERNAL_ERROR,
+                  JobEventType.JOB_SET_REDUCES,
+                  JobEventType.JOB_SET_WORKBUILDER_PORT))
           // create the topology tables
           .installTopology();
  
@@ -420,7 +445,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
     return this.committer;
   }
 
-  EventHandler getEventHandler() {
+  // !#! made public
+  public EventHandler getEventHandler() {
     return this.eventHandler;
   }
 
@@ -902,6 +928,17 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
   }
   */
 
+  // !#! Hack; undo w/ modif state machines
+  public synchronized void setWorkbuilderPort(int port) {
+    workbuilder_port = port;
+    notifyAll();
+  }
+
+  // !#! Hack; undo (called during creation)
+  public void setHttpPort(int port) {
+    http_port = port;
+  }
+
   public static class InitTransition 
       implements MultipleArcTransition<JobImpl, JobEvent, JobState> {
 
@@ -933,6 +970,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
         TaskSplitMetaInfo[] taskSplitMetaInfo = createSplits(job, job.jobId);
         job.numMapTasks = taskSplitMetaInfo.length;
         job.numReduceTasks = job.conf.getInt(MRJobConfig.NUM_REDUCES, 0);
+        if (job.conf.getBoolean("sailfish.mapred.job.use_ifile", false)) {
+          job.numReduceTasks = Math.min(1, job.numReduceTasks);
+        }
 
         if (job.numMapTasks == 0 && job.numReduceTasks == 0) {
           job.addDiagnostic("No of maps and reduces are 0 " + job.jobId);
@@ -1098,6 +1138,20 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
      */
     @Override
     public void transition(JobImpl job, JobEvent event) {
+      // !#!
+      if (job.conf.getBoolean("sailfish.mapred.job.use_ifile", false)) {
+        try {
+          startWorkBuilder(job);
+        } catch (InterruptedException e) {
+          throw new RuntimeException("Horrible hack didn't work", e);
+        } catch (IOException e) {
+          throw new RuntimeException("Horrible hack didn't work", e);          
+        }
+        for (Task t : job.getTasks().values()) {
+          ((TaskImpl)t).setWorkbuilderPort(job.workbuilder_port);
+        }
+      }
+
       job.startTime = job.clock.getTime();
       job.scheduleTasks(job.mapTasks);  // schedule (i.e., start) the maps
       job.scheduleTasks(job.reduceTasks);
@@ -1116,6 +1170,61 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
 			// If we have no tasks, just transition to job completed
       if (job.numReduceTasks == 0 && job.numMapTasks == 0) {
         job.eventHandler.handle(new JobEvent(job.jobId, JobEventType.JOB_COMPLETED));
+      }
+    }
+    
+    static class ChildOutputGrabber extends Thread {
+      BufferedReader childStdout;
+      ChildOutputGrabber(InputStream is) {
+        childStdout = new BufferedReader(new InputStreamReader(is));
+      }
+      @Override
+      public void run() {
+        // Grab the child stdout and dump to log
+        try {
+          String line;
+          while ((line = childStdout.readLine()) != null) {
+            LOG.info("workbuilder: " + line);
+          }
+        } catch (Exception e) {
+          LOG.warn("Child exited?");
+        }
+      }
+    }
+
+    protected void startWorkBuilder(JobImpl job)
+        throws IOException, InterruptedException {
+      synchronized (job) {
+        if (job.http_port <= 0) {
+          throw new IOException("Invalid HTTP port: " + job.http_port);
+        }
+        ProcessBuilder pb = new ProcessBuilder(
+            job.conf.get("sailfish.workbuilder.path"),
+            "-M", job.conf.get("sailfish.kfs.metaserver.host"),
+            "-P", job.conf.get("sailfish.kfs.metaserver.port"),
+            "-C", "0",
+            "-c", String.valueOf(job.http_port),
+            "-l", job.conf.get("sailfish.workbuilder.log", "/tmp/log"),
+            "-J", TypeConverter.fromYarn(job.getID()).toString());
+        pb.redirectErrorStream(true);
+        LOG.info("Starting workbuilder: " +
+            Arrays.toString(pb.command().toArray()));
+
+        job.workbuilder = pb.start();
+
+        // XXX should monitor this, too
+        Thread t = new ChildOutputGrabber(job.workbuilder.getInputStream());
+        t.start();
+        for (int i = 0; i < 30 && job.workbuilder_port == -1; ++i) {
+          LOG.info("Waiting for workbuilder to report...");
+          job.wait(5 * 1000); // XXX this is horrible
+        }
+        if (job.workbuilder_port == -1) {
+          LOG.fatal("Workbuilder didn't start");
+          LOG.debug("DEBUG");
+          Thread.sleep(Long.MAX_VALUE);
+          //throw new IOException("Workbuilder didn't report");
+        }
       }
     }
   }
@@ -1352,6 +1461,46 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
       
       // Return the current state, Job not finished yet
       return job.getState();
+    }
+  }
+
+  private static class JobSetNumReducesTransition
+    implements SingleArcTransition<JobImpl, JobEvent> {
+    @Override
+    public void transition(JobImpl job, JobEvent event) {
+      JobSetNumReducesEvent nr = (JobSetNumReducesEvent) event;
+      addReduceTasks(job, nr.getNumReduces());
+    }
+    public void addReduceTasks(JobImpl job, int newReduceTasks) {
+      Set<TaskId> newtasks = new LinkedHashSet<TaskId>();
+      for (int i = job.getTotalReduces(); i < newReduceTasks; i++) {
+        TaskImpl task =
+            new ReduceTaskImpl(job.jobId, i,
+                job.eventHandler,
+                job.remoteJobConfFile,
+                job.conf, job.numMapTasks,
+                job.taskAttemptListener, job.committer, job.jobToken,
+                job.fsTokens.getAllTokens(), job.clock,
+                job.completedTasksFromPreviousRun,
+                job.applicationAttemptId.getAttemptId(),
+                job.metrics);
+        job.addTask(task);
+        newtasks.add(task.getID());
+      }
+      job.scheduleTasks(newtasks);
+      job.numReduceTasks = job.getTotalReduces();
+      LOG.info("Number of reduces for job " + job.jobId + " = "
+          + job.numReduceTasks);
+    }
+
+  }
+
+  private static class JobSetWorkbuilderTransition
+    implements SingleArcTransition<JobImpl, JobEvent> {
+    @Override
+    public void transition(JobImpl job, JobEvent event) {
+      JobSetWorkbuilderPortEvent nr = (JobSetWorkbuilderPortEvent) event;
+      job.workbuilder_port = nr.getWorkBuilderPort();
     }
   }
 

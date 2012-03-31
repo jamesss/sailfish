@@ -137,7 +137,7 @@ public class TestTaskImpl {
         Token<JobTokenIdentifier> jobToken,
         Collection<Token<? extends TokenIdentifier>> fsTokens, Clock clock) {
       super(taskId, id, eventHandler, taskAttemptListener, jobFile, partition, conf,
-          dataLocations, committer, jobToken, fsTokens, clock);
+          dataLocations, committer, jobToken, fsTokens, clock, -1);
       attemptId = Records.newRecord(TaskAttemptId.class);
       attemptId.setId(id);
       attemptId.setTaskId(taskId);

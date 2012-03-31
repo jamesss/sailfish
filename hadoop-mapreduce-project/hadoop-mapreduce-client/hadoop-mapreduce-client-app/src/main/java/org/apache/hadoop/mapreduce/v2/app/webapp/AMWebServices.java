@@ -20,6 +20,8 @@ package org.apache.hadoop.mapreduce.v2.app.webapp;
 
 import java.io.IOException;
 
+import java.util.Map;
+
 import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.GET;
 import javax.ws.rs.Path;
@@ -29,10 +31,14 @@ import javax.ws.rs.QueryParam;
 import javax.ws.rs.WebApplicationException;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.mapreduce.JobACL;
+import org.apache.hadoop.mapreduce.TaskAttemptID;
+import org.apache.hadoop.mapreduce.TaskID;
+import org.apache.hadoop.mapreduce.TypeConverter;
 import org.apache.hadoop.mapreduce.v2.api.records.AMInfo;
 import org.apache.hadoop.mapreduce.v2.api.records.JobId;
 import org.apache.hadoop.mapreduce.v2.api.records.TaskAttemptId;
@@ -42,6 +48,11 @@ import org.apache.hadoop.mapreduce.v2.app.AppContext;
 import org.apache.hadoop.mapreduce.v2.app.job.Job;
 import org.apache.hadoop.mapreduce.v2.app.job.Task;
 import org.apache.hadoop.mapreduce.v2.app.job.TaskAttempt;
+import org.apache.hadoop.mapreduce.v2.app.job.event.JobSetNumReducesEvent;
+import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptEvent;
+import org.apache.hadoop.mapreduce.v2.app.job.event.TaskAttemptEventType;
+import org.apache.hadoop.mapreduce.v2.app.job.impl.JobImpl;
+import org.apache.hadoop.mapreduce.v2.app.job.impl.TaskAttemptImpl;
 import org.apache.hadoop.mapreduce.v2.app.webapp.dao.AppInfo;
 import org.apache.hadoop.mapreduce.v2.app.webapp.dao.AMAttemptInfo;
 import org.apache.hadoop.mapreduce.v2.app.webapp.dao.AMAttemptsInfo;
@@ -64,8 +75,14 @@ import org.apache.hadoop.yarn.webapp.NotFoundException;
 
 import com.google.inject.Inject;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 @Path("/ws/v1/mapreduce")
 public class AMWebServices {
+
+  static final Logger LOG = LoggerFactory.getLogger(AMWebServices.class);
+
   private final AppContext appCtx;
   private final App app;
   private final Configuration conf;
@@ -93,16 +110,27 @@ public class AMWebServices {
   /**
    * convert a job id string to an actual job and handle all the error checking.
    */
- public static Job getJobFromJobIdString(String jid, AppContext appCtx) throws NotFoundException {
-    JobId jobId;
-    Job job;
-    try {
-      jobId = MRApps.toJobID(jid);
-    } catch (YarnException e) {
-      throw new NotFoundException(e.getMessage());
+  public static Job getJobFromJobIdString(String jid, AppContext appCtx) throws NotFoundException {
+    Job job = null;
+    JobId jobId = null;
+    for (Map.Entry<JobId,Job> e : appCtx.getAllJobs().entrySet()) {
+      jobId = e.getKey();
+      job = appCtx.getJob(jobId);
+      if (null == job) {
+        LOG.error("Error getting itself! " + e.getKey().equals(e.getKey()));
+        continue;
+      }
+      return job;
     }
     if (jobId == null) {
-      throw new NotFoundException("job, " + jid + ", is not found");
+      try {
+        jobId = MRApps.toJobID(jid);
+      } catch (YarnException e) {
+        LOG.error("Failure parsing jid string", e);
+        throw new NotFoundException(e.getMessage());
+      }
+      if (null == jobId)
+        throw new NotFoundException("job, " + jid + ", is not found");
     }
     job = appCtx.getJob(jobId);
     if (job == null) {
@@ -202,6 +230,131 @@ public class AMWebServices {
       allJobs.add(new JobInfo(fullJob, hasAccess(fullJob, hsr)));
     }
     return allJobs;
+  }
+
+  @GET // XXX bad REST
+  @Path("/jobs/{jobid}/setnumreducers")
+  @Produces({ MediaType.TEXT_PLAIN })
+  // !#! Send event to job to increase #reducers
+  // !#! TODO Audit JobImpl code to ensure it waits for this call in sailfish
+  @SuppressWarnings("unchecked") // eventhandler not typesafe
+  public Response setNumReducers(@Context HttpServletRequest hsr,
+      @PathParam("jobid") String jid, @QueryParam("nreducers") int reducers) {
+    LOG.info("DEBUG setnumreducers(" + jid + ", " + reducers + ")");
+    JobImpl job = (JobImpl)getJobFromJobIdString(jid, appCtx);
+    if (job.getTotalReduces() > reducers) {
+      throw new BadRequestException("Fewer reduces than running: " + reducers);
+    }
+    job.getEventHandler().handle(
+        new JobSetNumReducesEvent(job.getID(), reducers));
+    String ret = "SUCCEEDED";
+    return Response.ok(ret).header("Content-Length", ret.length()).build();
+  }
+
+  @GET // XXX only a view of getJob
+  @Path("/jobs/{jobid}/numunfinishedmaps")
+  @Produces({ MediaType.TEXT_PLAIN })
+  public Response getUnfinishedMaps(@Context HttpServletRequest hsr,
+      @PathParam("jobid") String jid) {
+    LOG.info("DEBUG numunfinishedmaps(" + jid + ")");
+    JobInfo info = getJob(hsr, jid);
+    int unfinishedMaps = info.getMapsTotal() - info.getMapsCompleted();
+    String ret = jid + ":" + unfinishedMaps;
+    return Response.ok(ret).header("Content-Length", ret.length()).build();
+  }
+
+  @GET // XXX bad REST
+  @Path("/jobs/{jobid}/rerunmaptask")
+  @Produces({ MediaType.TEXT_PLAIN })
+  @SuppressWarnings("unchecked") // eventhandler not typesafe
+  public Response rerunMapTask(@Context HttpServletRequest hsr,
+      @PathParam("jobid") String jid, @QueryParam("id") final int mapId) {
+    LOG.info("DEBUG rerunmaptask(" + jid + ", " + mapId + ")");
+    String ret = jid + ":SUCCEEDED";  
+    try {
+      Job job = getJobFromJobIdString(jid, appCtx);
+      if (job.getTotalMaps() > mapId) {
+        throw new BadRequestException("More maps than exist: " + mapId);
+      }
+      // XXX Ugh.
+      TaskID mrTaskID = new TaskID(
+            TypeConverter.fromYarn(job.getID()),
+            org.apache.hadoop.mapreduce.TaskType.MAP,
+            mapId);
+      TaskId taskId = TypeConverter.toYarn(mrTaskID);
+      Task t = job.getTask(taskId);
+      if (null == t) {
+        throw new NotFoundException("Task " + taskId + " not found");
+      }
+      TaskAttemptID mrAttID = new TaskAttemptID(mrTaskID, 0);// TODO assume 0
+      // XXX change to JobMapTaskRescheduledEvent, to affected task
+      TaskAttemptId taskAttId = TypeConverter.toYarn(mrAttID);
+      TaskAttemptImpl att = (TaskAttemptImpl) t.getAttempt(taskAttId);
+      if (null == att) {
+        throw new NotFoundException("Task attempt " + att + " not found");
+      }
+      att.handle(new TaskAttemptEvent(taskAttId, 
+              TaskAttemptEventType.TA_TOO_MANY_FETCH_FAILURE));
+    } catch (NotFoundException e) {
+      ret = jid + ":NOTFOUND";
+    } catch (Exception e) {
+      // NOTE: doesn't actually verify that request was successful
+      ret = jid + ":FAILED";
+    }
+    return Response.ok(ret).header("Content-Length", ret.length()).build();
+  }
+
+  @GET // XXX bad REST
+  @Path("/jobs/{jobid}/workbuilderport")
+  @Produces({ MediaType.TEXT_PLAIN })
+  @SuppressWarnings("unchecked") // eventhandler not typesafe
+  public Response workBuilderPort(@Context HttpServletRequest hsr,
+      @PathParam("jobid") String jid, @QueryParam("port") final int port) {
+    JobImpl job = (JobImpl)getJobFromJobIdString(jid, appCtx);
+    // XXX DEBUG
+    System.out.println("SET_WORKBUILDER: " + jid + " : " + port);
+    job.setWorkbuilderPort(port);
+    //job.getEventHandler().handle(
+    //    new JobSetWorkbuilderPortEvent(job.getID(), port));
+    String ret = "SUCCEEDED";
+    return Response.ok(ret).header("Content-Length", ret.length()).build();
+  }
+
+  @GET
+  // XXX view of existing data
+  @Path("/jobs/{jobid}/status")
+  @Produces({ MediaType.TEXT_PLAIN })
+  public Response getJobStatus(@Context HttpServletRequest hsr,
+<<<<<<< Updated upstream
+      @PathParam("jobid") String jid) {
+    Job job = getJobFromJobIdString(jid, appCtx);
+    if (null == job) {
+      throw new NotFoundException("Could not find " + jid);
+    }
+
+    String ret = jid + " : " + job.getState();
+    return Response.ok(ret).header("Content-Length", ret.length()).build();
+  }
+
+  @GET // XXX return of # of reducers to preempt
+  @Path("/jobs/{jobid}/numreducerstopreempt")
+  @Produces({ MediaType.TEXT_PLAIN })
+  @SuppressWarnings("unchecked") // eventhandler not typesafe
+  public Response getNumReducersToPreempt(@Context HttpServletRequest hsr,
+=======
+>>>>>>> Stashed changes
+      @PathParam("jobid") String jid) {
+    Job job = getJobFromJobIdString(jid, appCtx);
+    if (null == job) {
+      throw new NotFoundException("Could not find " + jid);
+    }
+<<<<<<< Updated upstream
+    // !#! Fill in the value
+    String ret = job.getState().toString() + ":" + "0";
+=======
+    String ret = jid + " : " + job.getState();
+>>>>>>> Stashed changes
+    return Response.ok(ret).header("Content-Length", ret.length()).build();
   }
 
   @GET

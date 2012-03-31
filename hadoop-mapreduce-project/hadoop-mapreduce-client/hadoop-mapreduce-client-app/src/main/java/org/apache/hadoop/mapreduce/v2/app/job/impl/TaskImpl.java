@@ -100,6 +100,7 @@ public abstract class TaskImpl implements Task, EventHandler<TaskEvent> {
   private final Lock writeLock;
   private final MRAppMetrics metrics;
   private long scheduledTime;
+  protected int workbuilder_port;
   
   private final RecordFactory recordFactory = RecordFactoryProvider.getRecordFactory(null);
   
@@ -386,6 +387,13 @@ public abstract class TaskImpl implements Task, EventHandler<TaskEvent> {
     } finally {
       readLock.unlock();
     }
+  }
+
+  // !#!
+  public void setWorkbuilderPort(int port) {
+    writeLock.lock();
+    this.workbuilder_port = port;
+    writeLock.unlock();
   }
 
   //this is always called in read/write lock

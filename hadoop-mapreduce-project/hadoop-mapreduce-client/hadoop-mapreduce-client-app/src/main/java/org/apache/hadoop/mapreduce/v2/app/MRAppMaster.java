@@ -157,6 +157,7 @@ public class MRAppMaster extends CompositeService {
   private JobEventDispatcher jobEventDispatcher;
   private boolean inRecovery = false;
   private SpeculatorEventDispatcher speculatorEventDispatcher;
+  private int AMHttpPort = -1;
 
   private Job job;
   private Credentials fsTokens = new Credentials(); // Filled during init
@@ -189,6 +190,9 @@ public class MRAppMaster extends CompositeService {
   public void init(final Configuration conf) {
 
     downloadTokensAndSetupUGI(conf);
+    if (getConfig().getBoolean("sailfish.mapred.job.use_ifile", false)) {
+      conf.setFloat(MRJobConfig.COMPLETED_MAPS_FOR_REDUCE_SLOWSTART, 1.0f);
+    }
 
     context = new RunningAppContext(conf);
 
@@ -820,6 +824,10 @@ public class MRAppMaster extends CompositeService {
 
     //start all the components
     super.start();
+    // !#! Hack
+    if (getConfig().getBoolean("sailfish.mapred.job.use_ifile", false)) {
+      ((JobImpl)job).setHttpPort(clientService.getHttpPort());
+    }
 
     // All components have started, start the job.
     startJobs();
