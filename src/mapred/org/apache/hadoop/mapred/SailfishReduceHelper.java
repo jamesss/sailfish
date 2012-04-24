@@ -235,6 +235,7 @@ class SailfishReduceHelper {
     private String jobId;
     private String debugJobId;
 
+    @SuppressWarnings("unchecked")
     public SailfishReduceValuesIterator(int partition,
         RawComparator<KEY> comparator, Class<KEY> keyClass,
         Class<VALUE> valClass, JobConf conf, TaskReporter reporter,

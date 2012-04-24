@@ -38,10 +38,10 @@ import org.apache.hadoop.mapred.OutputCollector;
 import org.apache.hadoop.mapred.RecordReader;
 import org.apache.hadoop.mapred.Reducer;
 import org.apache.hadoop.mapred.Reporter;
-import org.apache.hadoop.mapred.TaskAttemptID;
 import org.apache.hadoop.mapred.MapTask.OldOutputCollector;
 import org.apache.hadoop.util.ReflectionUtils;
 
+@SuppressWarnings("deprecation")
 public class SailfishMapRunner<K1, V1, K2, V2> extends
     MapRunner<K1, V1, K2, V2> {
 
@@ -53,6 +53,7 @@ public class SailfishMapRunner<K1, V1, K2, V2> extends
   SetupHelper setupHelper;
   boolean mapIgnoresInput = false;
 
+  @SuppressWarnings({ "unchecked", "rawtypes" })
   @Override
   public void configure(JobConf job) {
     this.mapper = ReflectionUtils.newInstance(job.getMapperClass(), job);
@@ -67,8 +68,7 @@ public class SailfishMapRunner<K1, V1, K2, V2> extends
     }
   }
 
-
-
+  @SuppressWarnings({ "rawtypes", "unchecked" })
   @Override
   public void run(RecordReader<K1, V1> input, OutputCollector<K2, V2> output,
       Reporter reporter) throws IOException {
@@ -153,6 +153,8 @@ public class SailfishMapRunner<K1, V1, K2, V2> extends
         }
       }
     }
+   
+    @SuppressWarnings({ "static-access" })
     private void notifyWorkbuilder() throws IOException {
       // job tracker-jobid
       String debugJobid = hadoopJob.get("sailfish.mapred.debug_job.id", "");
@@ -295,6 +297,7 @@ public class SailfishMapRunner<K1, V1, K2, V2> extends
     NUMBER_FORMAT.setGroupingUsed(false);
   }
 
+  @SuppressWarnings("unused")
   private synchronized String getOutputName(int partition) {
     return "part-" + NUMBER_FORMAT.format(partition);
   }
