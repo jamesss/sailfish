@@ -90,9 +90,6 @@ class JobInProgress {
   private static float DEFAULT_COMPLETED_MAPS_PERCENT_FOR_REDUCE_SLOWSTART = 0.05f;
   int completedMapsForReduceSlowstart = 0;
   
-  private volatile int mapTasksToReclaim = 0;
-  private volatile int reduceTasksToReclaim = 0;
-  
   // runningMapTasks include speculative tasks, so we need to capture 
   // speculative tasks separately 
   int speculativeMapTasks = 0;
@@ -213,9 +210,6 @@ class JobInProgress {
 
   private Object schedulingInfo;
 
-  //Progress of Job
-  JobProgressStats progress = new JobProgressStats();
-  long prevProgessTime; // Previous progress update time
   
   /**
    * Create an almost empty JobInProgress, which can be used only for tests
@@ -229,9 +223,6 @@ class JobInProgress {
     this.anyCacheLevel = this.maxLevel+1;
     this.jobtracker = null;
     this.restartCount = 0;
-    // initialize job progress
-    this.progress.add(startTime, 0.0f, 0.0f);
-
   }
   
   /**
@@ -300,8 +291,6 @@ class JobInProgress {
     this.nonRunningReduces = new LinkedList<TaskInProgress>();    
     this.runningReduces = new LinkedHashSet<TaskInProgress>();
     this.resourceEstimator = new ResourceEstimator(this);
-    // initialize job progress
-    this.progress.add(startTime, 0.0f, 0.0f);
   }
 
   /**
@@ -350,11 +339,6 @@ class JobInProgress {
       new IdentityHashMap<Node, List<TaskInProgress>>(maxLevel);
     
     for (int i = 0; i < splits.length; i++) {
-      // !#! Sriram code change
-      // only when we are debugging reduce side is the following condition true
-      if (i >= maps.length)
-        break;
-      
       String[] splitLocations = splits[i].getLocations();
       if (splitLocations.length == 0) {
         nonLocalMaps.add(maps[i]);
@@ -440,11 +424,6 @@ class JobInProgress {
     }
     numMapTasks = splits.length;
 
-    if (conf.get("sailfish.mapred.debug_job.id", null) != null)
-      // Re-use the map output from a previous run---we are debugging.
-      // So, run a single map task to notify the workbuilder and get
-      // the planning for reduce going
-      numMapTasks = 1;
 
     // if the number of splits is larger than a configured value
     // then fail the job.
@@ -477,20 +456,11 @@ class JobInProgress {
     //
     // Create reduce tasks
     //
-    if ((numReduceTasks > 0)
-        && (conf.getBoolean("sailfish.mapred.job.use_ifile", false))) {
-      // using ifiles => # of reduce tasks is set dynamically.  To get the animation going,
-      // we need to schedule only a single reduce task.
-      LOG.info("# of reducers will be configured dynamically.  So, scheduling only one reducer");
-      // This change is only in the JT.  Doesn't affect the partitioning logic
-      // that goes into determining where a given key goes.
-      numReduceTasks = 1;
-    }
     this.reduces = new TaskInProgress[numReduceTasks];
     for (int i = 0; i < numReduceTasks; i++) {
       reduces[i] = new TaskInProgress(jobId, jobFile, 
-          numMapTasks, i, 
-          jobtracker, conf, this);
+                                      numMapTasks, i, 
+                                      jobtracker, conf, this);
       nonRunningReduces.add(reduces[i]);
     }
 
@@ -552,9 +522,6 @@ class JobInProgress {
   public JobStatus getStatus() {
     return status;
   }
-  public JobProgressStats getJobProgressStats() {
-    return progress;
-  }
   public synchronized long getLaunchTime() {
     return launchTime;
   }
@@ -604,47 +571,6 @@ class JobInProgress {
     }
     // log and change to the job's priority
     JobHistory.JobInfo.logJobPriority(jobId, priority);
-  }
-  
-  // Change the # of reduce tasks for this job. This will entail creating a new
-  // set of reduce tasks. Note that the # of reduce tasks can only be increased.
-  public synchronized boolean setNumReduceTasks(int nReduces) {
-    if (! conf.getBoolean("sailfish.mapred.job.use_ifile", false)) {
-      LOG.warn("Job conf says that we cannot change the # of reducers dynamically.");
-      return false;
-    }
-    LOG.info("# of reducers so far: " + this.reduces.length);
-    if (this.reduces.length >= nReduces) {
-      LOG.warn("Cannot decrease the # of reducers: have = " + numReduceTasks + " asked: " + nReduces);
-      return false;
-    }
-    
-    int oldNumReducers = this.reduces.length;
-    numReduceTasks = nReduces;
-    //
-    // Create reduce tasks:  Assume that we were run with only 1 reduce task to start with.
-    // This logic works primarily for Sailfish jobs.  Jobs are started with 1 reduce task;
-    // whenever reducer starts, we know maps are done.  We use some offline logic to figure out the
-    // # of reduce tasks; then, we notify the job tracker with the desired # of reducer tasks.
-    // At this point, we spin up the desired # of reduce tasks and throw them into the pile.
-    //
-    String jobFile = profile.getJobFile();
-
-    TaskInProgress[] oldReduces = this.reduces;
-
-    this.reduces = new TaskInProgress[numReduceTasks]; 
-
-    for (int i = 0; i < oldNumReducers; i++)
-      reduces[i] = oldReduces[i];
-    for (int i = oldNumReducers; i < numReduceTasks; i++) {
-      reduces[i] = new TaskInProgress(jobId, jobFile, 
-          numMapTasks, i, 
-          jobtracker, conf, this);
-      nonRunningReduces.add(reduces[i]);
-    }
-    oldReduces = null;
-    LOG.info("Changed the # of reduce tasks for job: " + jobId + " to " + nReduces);
-    return true;
   }
 
   // Update the job start/launch time (upon restart) and log to history
@@ -731,23 +657,6 @@ class JobInProgress {
   Set<TaskInProgress> getRunningReduces()
   {
     return runningReduces;
-  }
-  
-  int getMapPreemptionTarget() {
-    return mapTasksToReclaim;
-  }
-  
-  void setMapPreemptionTarget(int schedUpdate) {
-    mapTasksToReclaim = schedUpdate;
-  }
-  
-  int getReducePreemptionTarget() {
-    return reduceTasksToReclaim;
-  }
-  
-  void setReducePreemptionTarget(int schedUpdate) {
-    LOG.info(getJobID() + " preemption target set to " + schedUpdate);
-    reduceTasksToReclaim = schedUpdate;
   }
   
   /**
@@ -964,20 +873,12 @@ class JobInProgress {
     
     if (!tip.isJobCleanupTask() && !tip.isJobSetupTask()) {
       double progressDelta = tip.getProgress() - oldProgress;
-      long curTime = System.currentTimeMillis();
       if (tip.isMapTask()) {
           this.status.setMapProgress((float) (this.status.mapProgress() +
                                               progressDelta / maps.length));
       } else {
         this.status.setReduceProgress((float) (this.status.reduceProgress() + 
                                            (progressDelta / reduces.length)));
-      }
-      // Update only if we are past update interval
-      // This update is set to 3 sec for now
-      if ((curTime - this.prevProgessTime) > 3000) {
-        this.prevProgessTime = curTime;
-        this.progress.add(curTime, this.status.mapProgress(),
-            this.status.reduceProgress());
       }
     }
   }
@@ -1269,13 +1170,8 @@ class JobInProgress {
     }
   }
   
-  public synchronized boolean scheduleReduces() { // !#! Changes made by Sriram
-    // Allow scheduling of reduces for Sailfish Jobs AFTER all mappers are done.
-    if (conf.getBoolean("sailfish.mapred.job.use_ifile", false) == false) {
-      return finishedMapTasks >= completedMapsForReduceSlowstart;
-    }
-    // this is a Sailfish job
-    return finishedMapTasks == numMapTasks;
+  public synchronized boolean scheduleReduces() {
+    return finishedMapTasks >= completedMapsForReduceSlowstart;
   }
   
   /**
@@ -2210,9 +2106,6 @@ class JobInProgress {
         this.status.setReduceProgress(1.0f);
       }
       this.finishTime = System.currentTimeMillis();
-      this.progress.add(this.finishTime, this.status.mapProgress(),
-          this.status.reduceProgress());
-
       LOG.info("Job " + this.status.getJobID() + 
                " has completed successfully.");
       JobHistory.JobInfo.logFinished(this.status.getJobID(), finishTime, 
@@ -2696,21 +2589,17 @@ class JobInProgress {
     LOG.info("Failed fetch notification #" + fetchFailures + " for task " + 
             mapTaskId);
     
-    boolean isSailfishIFileFetchFailure = tip.isMapTask()
-        && conf.getBoolean("sailfish.mapred.job.use_ifile", false);
     float failureRate = (float)fetchFailures / runningReduceTasks;
     // declare faulty if fetch-failures >= max-allowed-failures
     boolean isMapFaulty = (failureRate >= MAX_ALLOWED_FETCH_FAILURES_PERCENT) 
                           ? true
                           : false;
-    if ((fetchFailures >= MAX_FETCH_FAILURES_NOTIFICATIONS
-        && isMapFaulty) || isSailfishIFileFetchFailure) {
-      String failureReason = isSailfishIFileFetchFailure ? "ifile read failure" : 
-        "Too many fetch-failures";
-      LOG.info(failureReason + " for output of task: " + mapTaskId + 
-                " ... killing it");
+    if (fetchFailures >= MAX_FETCH_FAILURES_NOTIFICATIONS
+        && isMapFaulty) {
+      LOG.info("Too many fetch-failures for output of task: " + mapTaskId 
+               + " ... killing it");
       
-      failedTask(tip, mapTaskId, failureReason,                            
+      failedTask(tip, mapTaskId, "Too many fetch-failures",                            
                  (tip.isMapTask() ? TaskStatus.Phase.MAP : 
                                     TaskStatus.Phase.REDUCE), 
                  TaskStatus.State.FAILED, trackerName);
@@ -2765,118 +2654,5 @@ class JobInProgress {
     } else {
       return Values.REDUCE.name();
     }
-  }
-  
-  // Stores progress history of job indexed by time.
-  // This could grow in size. Its better to have a config to
-  // control this or have fixed sized map
-  class JobProgressStats {
-    // We try to hold at most 1024 entries in progressMap
-    // Additional request would prune the progressMap by half
-    public TreeMap<Long, MapReduceProgress> progressMap = new TreeMap<Long, MapReduceProgress>();
-    private int MAX_SIZE = 1024;
-    private int curSize = 0;
-    private int prevPruneStart = 1;
-    boolean unBalancedJob = false;
-    boolean checkUnBalancedJob = false;
-
-    /**
-     * Allows adding only upto MAX_SIZE
-     * 
-     * @param key
-     * @param mapP
-     * @param reduceP
-     */
-    synchronized void add(long key, float mapP, float reduceP) {
-
-      if (curSize == MAX_SIZE) {
-        prune();
-        curSize = progressMap.size();
-      }
-
-      progressMap.put(new Long(key), new MapReduceProgress(mapP, reduceP));
-      curSize++;
-    }
-
-    MapReduceProgress getMapReduceProgress(Long key) {
-      return progressMap.get(key);
-    }
-
-    Long getNext(long nextStop) {
-      Iterator<Long> it = progressMap.keySet().iterator();
-      Long lastKey = it.next();
-      boolean hasValues = true;
-      while (hasValues && lastKey.longValue() < nextStop) {
-        if (it.hasNext())
-          lastKey = it.next();
-        else
-          hasValues = false;
-      }
-      return lastKey;
-    }
-
-    long getStartTime() {
-      return progressMap.firstKey().longValue();
-    }
-
-    long getIntervalTime() {
-      return progressMap.lastKey().longValue()
-          - progressMap.firstKey().longValue();
-    }
-
-    synchronized MapReduceProgress getProgress(long key) {
-      return progressMap.get(new Long(key));
-    }
-
-    public TreeMap<Long, MapReduceProgress> getProgressMap() {
-      return progressMap;
-    }
-
-    /**
-     * Prunes the progressMap when we see the capacity reached MAX_SIZE
-     */
-    synchronized void prune() {
-      Iterator<Long> it = progressMap.keySet().iterator();
-      if (prevPruneStart + 2 > progressMap.size())
-        prevPruneStart = 1;
-      for (int i = 0; i < prevPruneStart; i++)
-        if (it.hasNext())
-          it.next();
-      int count = prevPruneStart;
-      while (it.hasNext()) {
-        it.next();
-        if (((count % 2) == 1) && (count != 0) && (count != MAX_SIZE - 1)) {
-          it.remove();
-        }
-        count++;
-      }
-      prevPruneStart = progressMap.size() - 1;
-    }
-
-    // Stores map reduce progress
-    class MapReduceProgress {
-      public float mapProgress;
-      public float reduceProgress;
-
-      MapReduceProgress(float mapP, float reduceP) {
-        mapProgress = mapP;
-        reduceProgress = reduceP;
-      }
-
-      float getMapProgress() {
-        return mapProgress;
-      }
-
-      float getReduceProgress() {
-        return reduceProgress;
-      }
-    }
-  }
-
-  public int getNumFailedMapTasks() {
-    return failedMapTasks;
-  }
-  public int getNumFailedReduceTasks() {
-    return failedReduceTasks;
   }
 }

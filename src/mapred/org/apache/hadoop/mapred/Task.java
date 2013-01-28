@@ -53,12 +53,12 @@ import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 
 /** Base class for tasks. */
-abstract public class Task implements Writable, Configurable { // !#! Sriram: change to public
+abstract class Task implements Writable, Configurable {
   private static final Log LOG =
     LogFactory.getLog("org.apache.hadoop.mapred.TaskRunner");
 
   // Counters used by Task subclasses
-  public static enum Counter { // !#! Sriram: change to public
+  protected static enum Counter { 
     MAP_INPUT_RECORDS, 
     MAP_OUTPUT_RECORDS,
     MAP_SKIPPED_RECORDS,

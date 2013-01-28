@@ -141,7 +141,6 @@ public class BytesWritable extends BinaryComparable
    * @param offset the offset in newData to start at
    * @param length the number of bytes to copy
    */
-  @Override
   public void set(byte[] newData, int offset, int length) {
     setSize(0);
     setSize(length);

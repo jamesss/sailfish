@@ -772,11 +772,6 @@ public class JobClient extends Configured implements MRConstants, Tool  {
       job.getOutputFormat().checkOutputSpecs(fs, job);
     }
 
-    if ((reduces == 1) && (job.get("sailfish.mapred.debug_job.id", null) != null)) {
-      // XXX: hack...with pig sampling step is run with 1 reducer, so don't 
-      // do any of the debugging stuff
-      job.set("sailfish.mapred.debug_job.id", null);
-    }
     // Create the splits for the job
     LOG.debug("Creating splits at " + fs.makeQualified(submitSplitFile));
     int maps;

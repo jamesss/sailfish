@@ -24,9 +24,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
 
@@ -74,30 +72,16 @@ class CapacityTaskScheduler extends TaskScheduler {
    *   
    **********************************************************************/
 
-  static class TaskSchedulingInfo {
+  private static class TaskSchedulingInfo {
     /** 
      * the actual capacity, which depends on how many slots are available
      * in the cluster at any given time. 
      */
-    int capacity;
+    int capacity = 0;
     // number of running tasks
-    int numRunningTasks;
+    int numRunningTasks = 0;
     // number of slots occupied by running tasks
-    int numSlotsOccupied;
-    // number of pending tasks
-    int numPendingTasks;
-
-    TaskSchedulingInfo() {
-      this(0,0,0,0);
-    }
-
-    TaskSchedulingInfo(int capacity, int numRunningTasks, int numSlotsOccupied,
-        int numPendingTasks) {
-      this.capacity = capacity;
-      this.numRunningTasks = numRunningTasks;
-      this.numSlotsOccupied = numSlotsOccupied;
-      this.numPendingTasks = numPendingTasks;
-    }
+    int numSlotsOccupied = 0;
 
     /**
      * for each user, we need to keep track of number of slots occupied by
@@ -112,7 +96,6 @@ class CapacityTaskScheduler extends TaskScheduler {
     void resetTaskVars() {
       numRunningTasks = 0;
       numSlotsOccupied = 0;
-      numPendingTasks = 0;
       for (String s: numSlotsOccupiedByUser.keySet()) {
         numSlotsOccupiedByUser.put(s, Integer.valueOf(0));
       }
@@ -153,7 +136,7 @@ class CapacityTaskScheduler extends TaskScheduler {
     }
   }
   
-  static class QueueSchedulingInfo {
+  private static class QueueSchedulingInfo {
     String queueName;
 
     /** capacity(%) is set in the config */ 
@@ -170,7 +153,7 @@ class CapacityTaskScheduler extends TaskScheduler {
     
     /**
      * We keep track of the JobQueuesManager only for reporting purposes 
-     * (in toString()).
+     * (in toString()). 
      */
     private JobQueuesManager jobQueuesManager;
     
@@ -303,13 +286,11 @@ class CapacityTaskScheduler extends TaskScheduler {
    * There may be slight variations later, in which case we can make this
    * an abstract base class and have derived classes for Map and Reduce.  
    */
-  static abstract class TaskSchedulingMgr {
+  private static abstract class TaskSchedulingMgr {
 
     /** our TaskScheduler object */
-    protected final CapacityTaskScheduler scheduler;
-    protected final CapacityTaskScheduler.TYPE type;
-    protected boolean preempt;
-    protected double preemptFraction;
+    protected CapacityTaskScheduler scheduler;
+    protected CapacityTaskScheduler.TYPE type = null;
 
     abstract Task obtainNewTask(TaskTrackerStatus taskTracker, 
         JobInProgress job) throws IOException;
@@ -323,9 +304,6 @@ class CapacityTaskScheduler extends TaskScheduler {
     abstract int getRunningTasks(JobInProgress job);
     abstract int getPendingTasks(JobInProgress job);
     abstract TaskSchedulingInfo getTSI(QueueSchedulingInfo qsi);
-    
-    abstract void setPreemptionTarget();
-
     /**
      * To check if job has a speculative task on the particular tracker.
      * 
@@ -342,7 +320,7 @@ class CapacityTaskScheduler extends TaskScheduler {
      * indicates how much 'free space' the queue has, or how much it is over
      * capacity. This ordered list is iterated over, when assigning tasks.
      */  
-    protected final List<QueueSchedulingInfo> qsiForAssigningTasks = 
+    private List<QueueSchedulingInfo> qsiForAssigningTasks = 
       new ArrayList<QueueSchedulingInfo>();  
     /** 
      * Comparator to sort queues.
@@ -381,7 +359,7 @@ class CapacityTaskScheduler extends TaskScheduler {
     protected final static MapQueueComparator mapComparator = new MapQueueComparator();
     protected final static ReduceQueueComparator reduceComparator = new ReduceQueueComparator();
     // and this is the comparator to use
-    protected final QueueComparator queueComparator;
+    protected QueueComparator queueComparator;
 
     // Returns queues sorted according to the QueueComparator.
     // Mainly for testing purposes.
@@ -393,11 +371,8 @@ class CapacityTaskScheduler extends TaskScheduler {
       return queues.toArray(new String[queues.size()]);
     }
 
-    TaskSchedulingMgr(CapacityTaskScheduler scheduler,
-        CapacityTaskScheduler.TYPE type, QueueComparator queueComparator) {
-      this.scheduler = scheduler;
-      this.type = type;
-      this.queueComparator = queueComparator;
+    TaskSchedulingMgr(CapacityTaskScheduler sched) {
+      scheduler = sched;
     }
     
     // let the scheduling mgr know which queues are in the system
@@ -405,14 +380,6 @@ class CapacityTaskScheduler extends TaskScheduler {
       // add all the qsi objects to our list and sort
       qsiForAssigningTasks.addAll(qsiMap.values());
       Collections.sort(qsiForAssigningTasks, queueComparator);
-      // XXX Due to CS instantiation and testing idioms, the config is not
-      //     available in the constructor
-      preempt = scheduler.getConf().getBoolean(
-          "capacity.scheduler.preempt", false);
-      // enable preemption when available capacity is less than this fraction
-      preemptFraction = (double) scheduler.getConf().getFloat(
-          "capacity.scheduler.preempt.fraction", 0.02f);
-      LOG.info("Preemption is " + (preempt ? "ENABLED" : "DISABLED"));
     }
     
     private synchronized void updateCollectionOfQSIs() {
@@ -460,7 +427,7 @@ class CapacityTaskScheduler extends TaskScheduler {
       // who have been potentially initialized
 
       for (JobInProgress j : 
-        scheduler.getJobQueuesManager().getRunningJobQueue(qsi.queueName)) {
+        scheduler.jobQueuesManager.getRunningJobQueue(qsi.queueName)) {
         // only look at jobs that can be run. We ignore jobs that haven't 
         // initialized, or have completed but haven't been removed from the 
         // running queue. 
@@ -516,7 +483,7 @@ class CapacityTaskScheduler extends TaskScheduler {
       // create a list of jobs to look at (those whose users were over 
       // limit) in the first pass and walk through that list only. 
       for (JobInProgress j : 
-        scheduler.getJobQueuesManager().getRunningJobQueue(qsi.queueName)) {
+        scheduler.jobQueuesManager.getRunningJobQueue(qsi.queueName)) {
         if (j.getStatus().getRunState() != JobStatus.RUNNING) {
           continue;
         }
@@ -553,12 +520,9 @@ class CapacityTaskScheduler extends TaskScheduler {
     // Always return a TaskLookupResult object. Don't return null. 
     // The caller is responsible for ensuring that the QSI objects and the 
     // collections are up-to-date.
-    TaskLookupResult assignTasks(TaskTrackerStatus taskTracker)
-        throws IOException {
+    private TaskLookupResult assignTasks(TaskTrackerStatus taskTracker) throws IOException {
 
       printQSIs();
-      
-      TaskLookupResult ret = null;
 
       for (QueueSchedulingInfo qsi : qsiForAssigningTasks) {
         // we may have queues with capacity=0. We shouldn't look at jobs from 
@@ -566,12 +530,8 @@ class CapacityTaskScheduler extends TaskScheduler {
         if (0 == getTSI(qsi).capacity) {
           continue;
         }
-
         TaskLookupResult tlr = getTaskFromQueue(taskTracker, qsi);
         TaskLookupResult.LookUpStatus lookUpStatus = tlr.getLookUpStatus();
-        if (preempt) {
-          setPreemptionTarget();
-        }
 
         if (lookUpStatus == TaskLookupResult.LookUpStatus.NO_TASK_FOUND) {
           continue; // Look in other queues.
@@ -579,19 +539,17 @@ class CapacityTaskScheduler extends TaskScheduler {
 
         // if we find a task, return
         if (lookUpStatus == TaskLookupResult.LookUpStatus.TASK_FOUND) {
-          ret = tlr;
-          break;
+          return tlr;
         }
         // if there was a memory mismatch, return
         else if (lookUpStatus == 
           TaskLookupResult.LookUpStatus.TASK_FAILING_MEMORY_REQUIREMENT) {
-          ret = tlr;
-          break;
+            return tlr;
         }
       }
 
       // nothing to give
-      return null == ret ? TaskLookupResult.getNoTaskFoundResult() : ret;
+      return TaskLookupResult.getNoTaskFoundResult();
     }
 
     // for debugging.
@@ -638,10 +596,12 @@ class CapacityTaskScheduler extends TaskScheduler {
   /**
    * The scheduling algorithms for map tasks. 
    */
-  static class MapSchedulingMgr extends TaskSchedulingMgr {
+  private static class MapSchedulingMgr extends TaskSchedulingMgr {
 
     MapSchedulingMgr(CapacityTaskScheduler schedulr) {
-      super(schedulr, CapacityTaskScheduler.TYPE.MAP, mapComparator);
+      super(schedulr);
+      type = CapacityTaskScheduler.TYPE.MAP;
+      queueComparator = mapComparator;
     }
 
     @Override
@@ -690,21 +650,17 @@ class CapacityTaskScheduler extends TaskScheduler {
               job.getStatus().mapProgress(), tts));
     }
 
-    @Override
-    void setPreemptionTarget() {
-      // XXX map preemption not supported
-      // XXX This abstraction is wrong, but it prevents maps from interfering
-    }
-
   }
 
   /**
    * The scheduling algorithms for reduce tasks. 
    */
-  static class ReduceSchedulingMgr extends TaskSchedulingMgr {
+  private static class ReduceSchedulingMgr extends TaskSchedulingMgr {
 
     ReduceSchedulingMgr(CapacityTaskScheduler schedulr) {
-      super(schedulr, CapacityTaskScheduler.TYPE.REDUCE, reduceComparator);
+      super(schedulr);
+      type = CapacityTaskScheduler.TYPE.REDUCE;
+      queueComparator = reduceComparator;
     }
 
     @Override
@@ -754,86 +710,11 @@ class CapacityTaskScheduler extends TaskScheduler {
               job.getStatus().reduceProgress(), tts));
     }
 
-    private void clearPreempt() {
-      for (QueueSchedulingInfo q : qsiForAssigningTasks) {
-        TaskSchedulingInfo tsi = getTSI(q);
-        if (0 == tsi.capacity) {
-          continue;
-        }
-        for (JobInProgress j : scheduler.getJobQueuesManager()
-            .getRunningJobQueue(q.queueName)) {
-          if (j.getStatus().getRunState() != JobStatus.RUNNING) {
-            continue;
-          }
-          j.setReducePreemptionTarget(0);
-        }
-      }
-    }
-
-    @Override
-    void setPreemptionTarget() {
-      // !#! Sriram: This is code for preemption that we (Chris+Sriram) added.
-      ClusterStatus cluster = scheduler.taskTrackerManager.getClusterStatus();
-      ListIterator<QueueSchedulingInfo> i = qsiForAssigningTasks.listIterator();
-      if (cluster.getReduceTasks() <
-          cluster.getMaxReduceTasks() * (1 - preemptFraction)) {
-        // there's spare capacity; don't preempt
-        // TODO won't work for queues w/ cap smaller than preemption fraction
-        clearPreempt();
-        return;
-      }
-      int tasksOverCapacity = 0;
-      int tasksUnderCapacity = 0;
-      while (i.hasNext()) {
-        QueueSchedulingInfo q = i.next();
-        TaskSchedulingInfo tsi = getTSI(q);
-        if (0 == tsi.capacity) {
-          continue;
-        }
-        if (tsi.numSlotsOccupied > tsi.capacity) {
-          i.previous();
-          break;
-        }
-        tasksUnderCapacity += Math.min(tsi.numPendingTasks,
-            tsi.capacity - tsi.numSlotsOccupied);
-      }
-      if (0 == tasksUnderCapacity) {
-        clearPreempt();
-        return;
-      }
-      while (i.hasNext()) {
-        QueueSchedulingInfo q = i.next();
-        TaskSchedulingInfo tsi = getTSI(q);
-        tasksOverCapacity += tsi.numSlotsOccupied - tsi.capacity;
-      }
-      if (tasksOverCapacity <= cluster.getMaxReduceTasks() * preemptFraction) {
-        clearPreempt();
-        return;
-      }
-      final double reclaimFraction = tasksUnderCapacity
-          / (double) tasksOverCapacity;
-      while (i.hasPrevious()) {
-        QueueSchedulingInfo q = i.previous();
-        TaskSchedulingInfo tsi = getTSI(q);
-        int tasksToReclaim = (int)
-          Math.floor((tsi.numSlotsOccupied - tsi.capacity) * reclaimFraction);
-        for (JobInProgress j : scheduler.getJobQueuesManager()
-            .getRunningJobQueue(q.queueName)) {
-          if (j.getStatus().getRunState() != JobStatus.RUNNING) {
-            continue;
-          }
-          // XXX HACK: assume one job per queue
-          j.setReducePreemptionTarget(Math.max(0, tasksToReclaim));
-          break;
-        }
-      }
-    }
-
   }
-
+  
   /** the scheduling mgrs for Map and Reduce tasks */ 
-  protected final TaskSchedulingMgr mapScheduler = new MapSchedulingMgr(this);
-  protected final TaskSchedulingMgr reduceScheduler = new ReduceSchedulingMgr(this);
+  protected TaskSchedulingMgr mapScheduler = new MapSchedulingMgr(this);
+  protected TaskSchedulingMgr reduceScheduler = new ReduceSchedulingMgr(this);
 
   MemoryMatcher memoryMatcher = new MemoryMatcher(this);
 
@@ -882,11 +763,7 @@ class CapacityTaskScheduler extends TaskScheduler {
     this.jobQueuesManager = new JobQueuesManager(this);
     this.clock = clock;
   }
-
-  JobQueuesManager getJobQueuesManager() {
-    return jobQueuesManager;
-  }
-
+  
   /** mostly for testing purposes */
   public void setResourceManagerConf(CapacitySchedulerConf conf) {
     this.schedConf = conf;
@@ -1022,12 +899,12 @@ class CapacityTaskScheduler extends TaskScheduler {
       int ulMin = schedConf.getMinimumUserLimitPercent(queueName);
       // create our QSI and add to our hashmap
       QueueSchedulingInfo qsi = new QueueSchedulingInfo(queueName, capacity, 
-                                                    ulMin, getJobQueuesManager());
+                                                    ulMin, jobQueuesManager);
       queueInfoMap.put(queueName, qsi);
 
       // create the queues of job objects
       boolean supportsPrio = schedConf.isPrioritySupported(queueName);
-      getJobQueuesManager().createQueue(queueName, supportsPrio);
+      jobQueuesManager.createQueue(queueName, supportsPrio);
       
       SchedulingDisplayInfo schedulingInfo = 
         new SchedulingDisplayInfo(queueName, this);
@@ -1053,12 +930,12 @@ class CapacityTaskScheduler extends TaskScheduler {
     reduceScheduler.initialize(queueInfoMap);
     
     // listen to job changes
-    taskTrackerManager.addJobInProgressListener(getJobQueuesManager());
+    taskTrackerManager.addJobInProgressListener(jobQueuesManager);
 
     //Start thread for initialization
     if (initializationPoller == null) {
       this.initializationPoller = new JobInitializationPoller(
-          getJobQueuesManager(),schedConf,queues, taskTrackerManager);
+          jobQueuesManager,schedConf,queues, taskTrackerManager);
     }
     initializationPoller.init(queueManager.getQueues(), schedConf);
     initializationPoller.setDaemon(true);
@@ -1076,9 +953,9 @@ class CapacityTaskScheduler extends TaskScheduler {
   @Override
   public synchronized void terminate() throws IOException {
     if (!started) return;
-    if (getJobQueuesManager() != null) {
+    if (jobQueuesManager != null) {
       taskTrackerManager.removeJobInProgressListener(
-          getJobQueuesManager());
+          jobQueuesManager);
     }
     started = false;
     initializationPoller.terminate();
@@ -1087,7 +964,6 @@ class CapacityTaskScheduler extends TaskScheduler {
   
   @Override
   public synchronized void setConf(Configuration conf) {
-    // XXX 
     super.setConf(conf);
   }
 
@@ -1132,7 +1008,7 @@ class CapacityTaskScheduler extends TaskScheduler {
       qsi.reduceTSI.resetTaskVars();
       // update stats on running jobs
       for (JobInProgress j:
-        getJobQueuesManager().getRunningJobQueue(qsi.queueName)) {
+        jobQueuesManager.getRunningJobQueue(qsi.queueName)) {
         if (j.getStatus().getRunState() != JobStatus.RUNNING) {
           continue;
         }
@@ -1150,9 +1026,6 @@ class CapacityTaskScheduler extends TaskScheduler {
         qsi.reduceTSI.numRunningTasks += numReducesRunningForThisJob;
         qsi.mapTSI.numSlotsOccupied += numMapSlotsForThisJob;
         qsi.reduceTSI.numSlotsOccupied += numReduceSlotsForThisJob;
-        // update pending for RUNNING jobs only
-        qsi.mapTSI.numPendingTasks += j.pendingMaps();
-        qsi.reduceTSI.numPendingTasks += j.pendingReduces();
         Integer i =
             qsi.mapTSI.numSlotsOccupiedByUser.get(j.getProfile().getUser());
         qsi.mapTSI.numSlotsOccupiedByUser.put(j.getProfile().getUser(),
@@ -1339,12 +1212,12 @@ class CapacityTaskScheduler extends TaskScheduler {
   public synchronized Collection<JobInProgress> getJobs(String queueName) {
     Collection<JobInProgress> jobCollection = new ArrayList<JobInProgress>();
     Collection<JobInProgress> runningJobs = 
-        getJobQueuesManager().getRunningJobQueue(queueName);
+        jobQueuesManager.getRunningJobQueue(queueName);
     if (runningJobs != null) {
       jobCollection.addAll(runningJobs);
     }
     Collection<JobInProgress> waitingJobs = 
-      getJobQueuesManager().getWaitingJobs(queueName);
+      jobQueuesManager.getWaitingJobs(queueName);
     Collection<JobInProgress> tempCollection = new ArrayList<JobInProgress>();
     if(waitingJobs != null) {
       tempCollection.addAll(waitingJobs);

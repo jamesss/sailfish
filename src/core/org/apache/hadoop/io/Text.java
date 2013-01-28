@@ -200,7 +200,6 @@ public class Text extends BinaryComparable
    * @param start the first position of the new string
    * @param len the number of bytes of the new string
    */
-  @Override
   public void set(byte[] utf8, int start, int len) {
     setCapacity(len, false);
     System.arraycopy(utf8, start, bytes, 0, len);
@@ -262,7 +261,6 @@ public class Text extends BinaryComparable
    */
   public void readFields(DataInput in) throws IOException {
     int newLength = WritableUtils.readVInt(in);
-    // LOG.info("In deserialize..trying to read: " + newLength);
     setCapacity(newLength, false);
     in.readFully(bytes, 0, newLength);
     length = newLength;

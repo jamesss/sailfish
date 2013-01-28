@@ -33,11 +33,6 @@ public abstract class BinaryComparable implements Comparable<BinaryComparable> {
    * Return representative byte array for this instance.
    */
   public abstract byte[] getBytes();
-  
-
-  public void set(byte[] b, int offset, int length) {
-    throw new UnsupportedOperationException("Not implemented");
-  }
 
   /**
    * Compare bytes from {#getBytes()}.

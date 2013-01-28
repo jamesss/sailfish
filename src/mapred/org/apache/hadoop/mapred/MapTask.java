@@ -67,7 +67,7 @@ import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 
 /** A Map task. */
-public class MapTask extends Task { // !#! Sriram: change private to public
+class MapTask extends Task {
   /**
    * The size of each record in the index file for the map-outputs.
    */
@@ -436,13 +436,13 @@ public class MapTask extends Task { // !#! Sriram: change private to public
    * the configured partitioner should not be called. It's common for
    * partitioners to compute a result mod numReduces, which causes a div0 error
    */
-  public static class OldOutputCollector<K,V> implements OutputCollector<K,V> {  // !#! Sriram: change private to public
+  private static class OldOutputCollector<K,V> implements OutputCollector<K,V> {
     private final Partitioner<K,V> partitioner;
     private final MapOutputCollector<K,V> collector;
     private final int numPartitions;
 
     @SuppressWarnings("unchecked")
-    public OldOutputCollector(MapOutputCollector<K,V> collector, JobConf conf) { // !#! Sriram: change to public
+    OldOutputCollector(MapOutputCollector<K,V> collector, JobConf conf) {
       numPartitions = conf.getNumReduceTasks();
       if (numPartitions > 0) {
         partitioner = (Partitioner<K,V>)
@@ -521,12 +521,7 @@ public class MapTask extends Task { // !#! Sriram: change private to public
                        TaskUmbilicalProtocol umbilical,
                        TaskReporter reporter
                        ) throws IOException, ClassNotFoundException {
-      // !#! Sriram: Add the sailfish collector to setup for mapreduce
-      if (job.getBoolean("sailfish.mapred.job.use_ifile", false)) {
-        collector = new SailfishMapCollector<K,V>(job, reporter);
-      } else {
-        collector = new MapOutputBuffer<K,V>(umbilical, job, reporter);
-      }
+      collector = new MapOutputBuffer<K,V>(umbilical, job, reporter);
       partitions = jobContext.getNumReduceTasks();
       if (partitions > 0) {
         partitioner = (org.apache.hadoop.mapreduce.Partitioner<K,V>)
@@ -539,11 +534,6 @@ public class MapTask extends Task { // !#! Sriram: change private to public
           }
         };
       }
-    }
-    
-    //!#! Sriram: Add the sailfish setup for mapreduce
-    public MapOutputCollector<K,V> getCollector() {
-      return collector;
     }
 
     @Override
@@ -621,9 +611,6 @@ public class MapTask extends Task { // !#! Sriram: change private to public
            new NewDirectOutputCollector(taskContext, job, umbilical, reporter);
       } else {
         output = new NewOutputCollector(taskContext, job, umbilical, reporter);
-        if (job.getBoolean("sailfish.mapred.job.use_ifile", false)) {
-          mapper.setOutputCollector(((NewOutputCollector) output).getCollector());
-        }
       }
 
       mapperContext = contextConstructor.newInstance(mapper, job, getTaskID(),
@@ -634,10 +621,6 @@ public class MapTask extends Task { // !#! Sriram: change private to public
       mapper.run(mapperContext);
       input.close();
       output.close(mapperContext);
-      if (job.getBoolean("sailfish.mapred.job.use_ifile", false)) {
-        reporter.progress();
-        mapper.sailfishClose();
-      }
     } catch (NoSuchMethodException e) {
       throw new IOException("Can't find Context constructor", e);
     } catch (InstantiationException e) {
@@ -649,7 +632,7 @@ public class MapTask extends Task { // !#! Sriram: change private to public
     }
   }
 
-  public interface MapOutputCollector<K, V> {  // !#! Sriram: change private to public
+  interface MapOutputCollector<K, V> {
 
     public void collect(K key, V value, int partition
                         ) throws IOException, InterruptedException;

@@ -60,7 +60,6 @@ import org.apache.hadoop.ipc.RPC.VersionMismatch;
 import org.apache.hadoop.mapred.JobHistory.Keys;
 import org.apache.hadoop.mapred.JobHistory.Listener;
 import org.apache.hadoop.mapred.JobHistory.Values;
-import org.apache.hadoop.mapred.JobInProgress.JobProgressStats;
 import org.apache.hadoop.mapred.JobInProgress.KillInterruptedException;
 import org.apache.hadoop.mapred.JobStatusChangeEvent.EventType;
 import org.apache.hadoop.net.DNSToSwitchMapping;
@@ -1626,20 +1625,6 @@ public class JobTracker implements MRConstants, InterTrackerProtocol,
       infoServer.setAttribute("fileSys", historyFS);
     }
     infoServer.addServlet("reducegraph", "/taskgraph", TaskGraphServlet.class);
-    infoServer.addServlet("setnumreducers", "/setnumreducers", SetNumReducersServlet.class);
-    infoServer.addServlet("numreduceslotsover", "/numreduceslotsover", SailfishNumReduceSlotsOverCapacityServlet.class);
-    infoServer.addServlet("numunfinishedmaps", "/numunfinishedmaps", SailfishNumUnfinishedMapsServlet.class);
-    infoServer.addServlet("numtaskpreempt", "/numtaskpreempt", SailfishNumTasksPreemptServlet.class);
-    infoServer.addServlet("rerunmaptask", "/rerunmaptask", SailfishMapRerunnerServlet.class);
-    infoServer.addServlet("jobinfo", "/jobinfo", JobInfoServlet.class);
-    infoServer.addServlet("jobcounters", "/jobcounters", JobCountersServlet.class);
-    /*
-    infoServer.addServlet("jobprogressgraph", "/jobprogressgraph",
-        JobProgressServlet.class);
-    */
-    infoServer.addServlet("taskprogress", "/taskprogress",
-        TaskProgressServlet.class);
-
     infoServer.start();
     
     this.trackerIdentifier = identifier;
@@ -3266,16 +3251,6 @@ public class JobTracker implements MRConstants, InterTrackerProtocol,
     }
     return completedJobStatusStore.readCounters(jobid);
   }
-  public JobProgressStats getJobProgressStats(JobID jobid) {
-    synchronized(this) {
-      JobInProgress job = jobs.get(jobid);
-      if (job != null) {
-        return job.getJobProgressStats();
-      } else {
-        return null;
-      }
-    }
-  }
   public synchronized TaskReport[] getMapTaskReports(JobID jobid) {
     JobInProgress job = jobs.get(jobid);
     if (job == null) {
@@ -3662,15 +3637,6 @@ public class JobTracker implements MRConstants, InterTrackerProtocol,
         if (!tip.isComplete() || 
             (tip.isMapTask() && !tip.isJobSetupTask() && 
              job.desiredReduces() != 0)) {
-          if ((tip.isComplete() && tip.isMapTask() && job.getJobConf()
-              .getBoolean("sailfish.mapred.job.use_ifile", false))) {
-            // #!# Addition by Sriram: If the completed map task is from a
-            // Sailfish job
-            // and it was running on this tracker, we don't need to re-run it:
-            // the output from the mapper is saved into I-file.
-            // The I-file is in DFS.
-            markCompletedTaskAttempt(trackerName, taskId);
-          }
           // if the job is done, we don't want to change anything
           if (job.getStatus().getRunState() == JobStatus.RUNNING ||
               job.getStatus().getRunState() == JobStatus.PREP) {
