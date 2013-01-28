@@ -21,11 +21,11 @@ package org.apache.hadoop.fs;
 import java.io.*;
 import java.net.URI;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileLock;
 import java.util.*;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.permission.*;
+import org.apache.hadoop.io.nativeio.NativeIO;
 import org.apache.hadoop.util.Progressable;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Shell;
@@ -40,6 +40,14 @@ public class RawLocalFileSystem extends FileSystem {
   
   public RawLocalFileSystem() {
     workingDir = new Path(System.getProperty("user.dir")).makeQualified(this);
+  }
+  
+  private Path makeAbsolute(Path f) {
+    if (f.isAbsolute()) {
+      return f;
+    } else {
+      return new Path(workingDir, f);
+    }
   }
   
   /** Convert a path to a File. */
@@ -221,15 +229,28 @@ public class RawLocalFileSystem extends FileSystem {
   }
 
   /** {@inheritDoc} */
+  @Override
   public FSDataOutputStream create(Path f, boolean overwrite, int bufferSize,
                                    short replication, long blockSize, Progressable progress)
+  throws IOException {
+    return create(f, overwrite, true, bufferSize, replication, blockSize, progress);
+  }
+
+  private FSDataOutputStream create(Path f, boolean overwrite, 
+      boolean createParent, int bufferSize,
+      short replication, long blockSize, Progressable progress)
     throws IOException {
     if (exists(f) && !overwrite) {
       throw new IOException("File already exists:"+f);
     }
     Path parent = f.getParent();
-    if (parent != null && !mkdirs(parent)) {
-      throw new IOException("Mkdirs failed to create " + parent.toString());
+    if (parent != null) {
+      if (!createParent && !exists(parent)) {
+        throw new FileNotFoundException("Parent directory doesn't exist: "
+            + parent);
+      } else if (!mkdirs(parent)) {
+        throw new IOException("Mkdirs failed to create " + parent);
+      }
     }
     return new FSDataOutputStream(new BufferedOutputStream(
         new LocalFSFileOutputStream(f, false), bufferSize), statistics);
@@ -245,11 +266,24 @@ public class RawLocalFileSystem extends FileSystem {
     setPermission(f, permission);
     return out;
   }
-  
+
+  /** {@inheritDoc} */
+  @Override
+  public FSDataOutputStream createNonRecursive(Path f, FsPermission permission,
+      boolean overwrite,
+      int bufferSize, short replication, long blockSize,
+      Progressable progress) throws IOException {
+    FSDataOutputStream out = create(f,
+        overwrite, false, bufferSize, replication, blockSize, progress);
+    setPermission(f, permission);
+    return out;
+  }
+
   public boolean rename(Path src, Path dst) throws IOException {
     if (pathToFile(src).renameTo(pathToFile(dst))) {
       return true;
     }
+    LOG.debug("Falling through to a copy of " + src + " to " + dst);
     return FileUtil.copy(this, src, this, dst, true, getConf());
   }
   
@@ -263,7 +297,7 @@ public class RawLocalFileSystem extends FileSystem {
     if (f.isFile()) {
       return f.delete();
     } else if ((!recursive) && f.isDirectory() && 
-        (f.listFiles().length != 0)) {
+        (FileUtil.listFiles(f).length != 0)) {
       throw new IOException("Directory " + f.toString() + " is not empty");
     }
     return FileUtil.fullyDelete(f);
@@ -321,7 +355,9 @@ public class RawLocalFileSystem extends FileSystem {
    */
   @Override
   public void setWorkingDirectory(Path newDir) {
-    workingDir = newDir;
+    workingDir = makeAbsolute(newDir);
+    checkPath(workingDir);
+    
   }
   
   @Override
@@ -405,8 +441,8 @@ public class RawLocalFileSystem extends FileSystem {
       IOException e = null;
       try {
         StringTokenizer t = new StringTokenizer(
-            execCommand(new File(getPath().toUri()), 
-                        Shell.getGET_PERMISSION_COMMAND()));
+            FileUtil.execCommand(new File(getPath().toUri()), 
+                                 Shell.getGET_PERMISSION_COMMAND()));
         //expected format
         //-rw-------    1 username groupname ...
         String permission = t.nextToken();
@@ -456,11 +492,11 @@ public class RawLocalFileSystem extends FileSystem {
     }
 
     if (username == null) {
-      execCommand(pathToFile(p), Shell.SET_GROUP_COMMAND, groupname); 
+      FileUtil.execCommand(pathToFile(p), Shell.SET_GROUP_COMMAND, groupname); 
     } else {
       //OWNER[:[GROUP]]
       String s = username + (groupname == null? "": ":" + groupname);
-      execCommand(pathToFile(p), Shell.SET_OWNER_COMMAND, s);
+      FileUtil.execCommand(pathToFile(p), Shell.SET_OWNER_COMMAND, s);
     }
   }
 
@@ -469,16 +505,7 @@ public class RawLocalFileSystem extends FileSystem {
    */
   @Override
   public void setPermission(Path p, FsPermission permission
-      ) throws IOException {
-    execCommand(pathToFile(p), Shell.SET_PERMISSION_COMMAND,
-        String.format("%04o", permission.toShort()));
-  }
-
-  private static String execCommand(File f, String... cmd) throws IOException {
-    String[] args = new String[cmd.length + 1];
-    System.arraycopy(cmd, 0, args, 0, cmd.length);
-    args[cmd.length] = f.getCanonicalPath();
-    String output = Shell.execCommand(args);
-    return output;
+                            ) throws IOException {
+    FileUtil.setPermission(pathToFile(p), permission);
   }
 }

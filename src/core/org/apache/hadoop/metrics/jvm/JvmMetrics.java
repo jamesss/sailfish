@@ -22,6 +22,9 @@ import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.metrics.MetricsContext;
 import org.apache.hadoop.metrics.MetricsRecord;
 import org.apache.hadoop.metrics.MetricsUtil;
@@ -37,7 +40,11 @@ import org.apache.commons.logging.LogFactory;
  * Singleton class which reports Java Virtual Machine metrics to the metrics API.  
  * Any application can create an instance of this class in order to emit
  * Java VM metrics.  
+ * @deprecated in favor of <code>org.apache.hadoop.metrics2</code> usage.
  */
+@Deprecated
+@InterfaceAudience.Private
+@InterfaceStability.Evolving
 public class JvmMetrics implements Updater {
     
     private static final float M = 1024*1024;
@@ -104,10 +111,13 @@ public class JvmMetrics implements Updater {
                 memoryMXBean.getNonHeapMemoryUsage();
         MemoryUsage memHeap =
                 memoryMXBean.getHeapMemoryUsage();
+        Runtime runtime = Runtime.getRuntime();
+
         metrics.setMetric("memNonHeapUsedM", memNonHeap.getUsed()/M);
         metrics.setMetric("memNonHeapCommittedM", memNonHeap.getCommitted()/M);
         metrics.setMetric("memHeapUsedM", memHeap.getUsed()/M);
         metrics.setMetric("memHeapCommittedM", memHeap.getCommitted()/M);
+        metrics.setMetric("maxMemoryM", runtime.maxMemory()/M);
     }
     
     private void doGarbageCollectionUpdates() {

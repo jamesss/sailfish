@@ -88,6 +88,25 @@ public class DatanodeInfo extends DatanodeID implements Node {
     this.hostName = hostName;
   }
   
+  /** Constructor */
+  public DatanodeInfo(final String name, final String storageID,
+      final int infoPort, final int ipcPort,
+      final long capacity, final long dfsUsed, final long remaining,
+      final long lastUpdate, final int xceiverCount,
+      final String networkLocation, final String hostName,
+      final AdminStates adminState) {
+    super(name, storageID, infoPort, ipcPort);
+
+    this.capacity = capacity;
+    this.dfsUsed = dfsUsed;
+    this.remaining = remaining;
+    this.lastUpdate = lastUpdate;
+    this.xceiverCount = xceiverCount;
+    this.location = networkLocation;
+    this.hostName = hostName;
+    this.adminState = adminState;
+  }
+
   /** The raw capacity. */
   public long getCapacity() { return capacity; }
   
@@ -162,7 +181,20 @@ public class DatanodeInfo extends DatanodeID implements Node {
   public void setHostName(String host) {
     hostName = host;
   }
-  
+
+  /** Return hostname:port if requested, ip:port otherwise */
+  public String getName(boolean useHostname) {
+    return useHostname ? getHostName() + ":" + getPort() : getName();
+  }
+
+  /** Return hostname:ipcPort if requested, ip:ipcPort otherwise */
+  public String getNameWithIpcPort(boolean useHostname) {
+    // NB: DatanodeID#getHost returns the IP, ie the name without
+    // the port, not the hostname as the name implies
+    return useHostname ? getHostName() + ":" + getIpcPort()
+                       : getHost() + ":" + getIpcPort();
+  }
+
   /** A formatted string for reporting the status of the DataNode. */
   public String getDatanodeReport() {
     StringBuffer buffer = new StringBuffer();
@@ -264,9 +296,26 @@ public class DatanodeInfo extends DatanodeID implements Node {
   }
 
   /**
+   * Check if the datanode is in stale state. Here if the namenode has not
+   * received heartbeat msg from a datanode for more than staleInterval (default
+   * value is
+   * {@link DFSConfigKeys#DFS_NAMENODE_STALE_DATANODE_INTERVAL_MILLI_DEFAULT}),
+   * the datanode will be treated as stale node.
+   * 
+   * @param staleInterval
+   *          the time interval for marking the node as stale. If the last
+   *          update time is beyond the given time interval, the node will be
+   *          marked as stale.
+   * @return true if the node is stale
+   */
+  public boolean isStale(long staleInterval) {
+    return (System.currentTimeMillis() - lastUpdate) >= staleInterval;
+  }
+  
+  /**
    * Retrieves the admin state of this node.
    */
-  AdminStates getAdminState() {
+  public AdminStates getAdminState() {
     if (adminState == null) {
       return AdminStates.NORMAL;
     }

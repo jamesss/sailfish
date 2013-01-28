@@ -23,24 +23,34 @@ import java.io.FileWriter;
 import java.io.Writer;
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import java.util.StringTokenizer;
 
 import junit.framework.TestCase;
-import junit.extensions.TestSetup;
-import junit.framework.Test;
-import junit.framework.TestSuite;
 
 import static org.apache.hadoop.mapred.Task.Counter.SPILLED_RECORDS;
 import static org.apache.hadoop.mapred.Task.Counter.MAP_INPUT_RECORDS;
 import static org.apache.hadoop.mapred.Task.Counter.MAP_OUTPUT_RECORDS;
+import static org.apache.hadoop.mapred.Task.Counter.MAP_INPUT_BYTES;
+import static org.apache.hadoop.mapred.Task.Counter.MAP_OUTPUT_BYTES;
+import static org.apache.hadoop.mapred.Task.Counter.MAP_OUTPUT_MATERIALIZED_BYTES;
+import static org.apache.hadoop.mapred.Task.Counter.COMMITTED_HEAP_BYTES;
 
+import org.apache.commons.lang.RandomStringUtils;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.WritableComparable;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapred.FileInputFormat;
 
 /**
  * This is an wordcount application that tests job counters.
@@ -57,6 +67,29 @@ public class TestJobCounters extends TestCase {
   String TEST_ROOT_DIR = new Path(System.getProperty("test.build.data",
                           File.separator + "tmp")).toString().replace(' ', '+');
  
+  private void validateMapredFileCounters(Counters counter, long mapInputBytes,
+      long fileBytesRead, long fileBytesWritten, long mapOutputBytes,
+      long mapOutputMaterializedBytes) {
+
+    assertTrue(counter.findCounter(MAP_INPUT_BYTES).getValue() != 0);
+    assertEquals(mapInputBytes, counter.findCounter(MAP_INPUT_BYTES).getValue());
+
+    assertTrue(counter.findCounter(FileInputFormat.Counter.BYTES_READ)
+        .getValue() != 0);
+    assertEquals(fileBytesRead,
+        counter.findCounter(FileInputFormat.Counter.BYTES_READ).getValue());
+
+    assertTrue(counter.findCounter(FileOutputFormat.Counter.BYTES_WRITTEN)
+        .getValue() != 0);
+
+    if (mapOutputBytes >= 0) {
+      assertTrue(counter.findCounter(MAP_OUTPUT_BYTES).getValue() != 0);
+    }
+    if (mapOutputMaterializedBytes >= 0) {
+      assertTrue(counter.findCounter(MAP_OUTPUT_MATERIALIZED_BYTES).getValue() != 0);
+    }
+  }
+  
   private void validateMapredCounters(Counters counter, long spillRecCnt, 
                                 long mapInputRecords, long mapOutputRecords) {
     // Check if the numer of Spilled Records is same as expected
@@ -68,6 +101,35 @@ public class TestJobCounters extends TestCase {
       counter.findCounter(MAP_OUTPUT_RECORDS).getCounter());
   }
 
+  
+  private void validateFileCounters(
+      org.apache.hadoop.mapreduce.Counters counter, long fileBytesRead,
+      long fileBytesWritten, long mapOutputBytes,
+      long mapOutputMaterializedBytes) {
+    assertTrue(counter
+        .findCounter(
+            org.apache.hadoop.mapreduce.lib.input.FileInputFormat.Counter.BYTES_READ)
+        .getValue() != 0);
+    assertEquals(
+        fileBytesRead,
+        counter
+            .findCounter(
+                org.apache.hadoop.mapreduce.lib.input.FileInputFormat.Counter.BYTES_READ)
+            .getValue());
+
+    assertTrue(counter
+        .findCounter(
+            org.apache.hadoop.mapreduce.lib.output.FileOutputFormat.Counter.BYTES_WRITTEN)
+        .getValue() != 0);
+
+    if (mapOutputBytes >= 0) {
+      assertTrue(counter.findCounter(MAP_OUTPUT_BYTES).getValue() != 0);
+    }
+    if (mapOutputMaterializedBytes >= 0) {
+      assertTrue(counter.findCounter(MAP_OUTPUT_MATERIALIZED_BYTES).getValue() != 0);
+    }
+  }
+  
   private void validateCounters(org.apache.hadoop.mapreduce.Counters counter, 
                                 long spillRecCnt, 
                                 long mapInputRecords, long mapOutputRecords) {
@@ -142,13 +204,17 @@ public class TestJobCounters extends TestCase {
         throw new IOException("Mkdirs failed to create " + wordsIns.toString());
       }
 
+      long inputSize = 0;
       //create 3 input files each with 5*2k words
       File inpFile = new File(inDir + "input5_2k_1");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
       inpFile = new File(inDir + "input5_2k_2");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
       inpFile = new File(inDir + "input5_2k_3");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
 
       FileInputFormat.setInputPaths(conf, inDir);
       Path outputPath1 = new Path(outDir, "output5_2k_3");
@@ -172,10 +238,12 @@ public class TestJobCounters extends TestCase {
       //3 maps and 2.5k lines --- So total 7.5k map input records
       //3 maps and 10k words in each --- So total of 30k map output recs
       validateMapredCounters(c1, 64000, 7500, 30000);
+      validateMapredFileCounters(c1, inputSize, inputSize, 0, 0, 0);
 
       //create 4th input file each with 5*2k words and test with 4 maps
       inpFile = new File(inDir + "input5_2k_4");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
       conf.setNumMapTasks(4);
       Path outputPath2 = new Path(outDir, "output5_2k_4");
       FileOutputFormat.setOutputPath(conf, outputPath2);
@@ -198,6 +266,7 @@ public class TestJobCounters extends TestCase {
       // 4 maps and 2.5k words in each --- So 10k map input records
       // 4 maps and 10k unique words --- So 40k map output records
       validateMapredCounters(c1, 88000, 10000, 40000);
+      validateMapredFileCounters(c1, inputSize, inputSize, 0, 0, 0);
       
       // check for a map only job
       conf.setNumReduceTasks(0);
@@ -209,6 +278,7 @@ public class TestJobCounters extends TestCase {
       // 4 maps and 2.5k words in each --- So 10k map input records
       // 4 maps and 10k unique words --- So 40k map output records
       validateMapredCounters(c1, 0, 10000, 40000);
+      validateMapredFileCounters(c1, inputSize, inputSize, 0, -1, -1);
     } finally {
       //clean up the input and output files
       if (fs.exists(testDir)) {
@@ -278,13 +348,17 @@ public class TestJobCounters extends TestCase {
       }
       String outDir = testDir + File.separator;
 
+      long inputSize = 0;
       //create 3 input files each with 5*2k words
       File inpFile = new File(inDir + "input5_2k_1");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
       inpFile = new File(inDir + "input5_2k_2");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
       inpFile = new File(inDir + "input5_2k_3");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
 
       FileInputFormat.setInputPaths(conf, inDir);
       Path outputPath1 = new Path(outDir, "output5_2k_3");
@@ -307,6 +381,7 @@ public class TestJobCounters extends TestCase {
       job.waitForCompletion(false);
       
       org.apache.hadoop.mapreduce.Counters c1 = job.getCounters();
+      LogFactory.getLog(this.getClass()).info(c1);
       // 3maps & in each map, 4 first level spills --- So total 12.
       // spilled records count:
       // Each Map: 1st level:2k+2k+2k+2k=8k;2ndlevel=4k+4k=8k;
@@ -323,10 +398,12 @@ public class TestJobCounters extends TestCase {
       //3 maps and 2.5k lines --- So total 7.5k map input records
       //3 maps and 10k words in each --- So total of 30k map output recs
       validateCounters(c1, 64000, 7500, 30000);
+      validateFileCounters(c1, inputSize, 0, 0, 0);
 
       //create 4th input file each with 5*2k words and test with 4 maps
       inpFile = new File(inDir + "input5_2k_4");
       createWordsFile(inpFile);
+      inputSize += inpFile.length();
       JobConf newJobConf = new JobConf(job.getConfiguration());
       
       Path outputPath2 = new Path(outDir, "output5_2k_4");
@@ -336,6 +413,7 @@ public class TestJobCounters extends TestCase {
       Job newJob = new Job(newJobConf);
       newJob.waitForCompletion(false);
       c1 = newJob.getCounters();
+      LogFactory.getLog(this.getClass()).info(c1);
       // 4maps & in each map 4 first level spills --- So total 16.
       // spilled records count:
       // Each Map: 1st level:2k+2k+2k+2k=8k;2ndlevel=4k+4k=8k;
@@ -352,6 +430,7 @@ public class TestJobCounters extends TestCase {
       // 4 maps and 2.5k words in each --- So 10k map input records
       // 4 maps and 10k unique words --- So 40k map output records
       validateCounters(c1, 88000, 10000, 40000);
+      validateFileCounters(c1, inputSize, 0, 0, 0);
       
       JobConf newJobConf2 = new JobConf(newJob.getConfiguration());
       
@@ -363,14 +442,262 @@ public class TestJobCounters extends TestCase {
       newJob2.setNumReduceTasks(0);
       newJob2.waitForCompletion(false);
       c1 = newJob2.getCounters();
+      LogFactory.getLog(this.getClass()).info(c1);
       // 4 maps and 2.5k words in each --- So 10k map input records
       // 4 maps and 10k unique words --- So 40k map output records
       validateCounters(c1, 0, 10000, 40000);
+      validateFileCounters(c1, inputSize, 0, -1, -1);
+      
     } finally {
       //clean up the input and output files
       if (fs.exists(testDir)) {
         fs.delete(testDir, true);
       }
+    }
+  }
+  
+  /** 
+   * Increases the JVM's heap usage to the specified target value.
+   */
+  static class MemoryLoader {
+    private static final int DEFAULT_UNIT_LOAD_SIZE = 10 * 1024 * 1024; // 10mb
+    
+    // the target value to reach
+    private long targetValue;
+    // a list to hold the load objects
+    private List<String> loadObjects = new ArrayList<String>();
+    
+    MemoryLoader(long targetValue) {
+      this.targetValue = targetValue;
+    }
+    
+    /**
+     * Loads the memory to the target value.
+     */
+    void load() {
+      while (Runtime.getRuntime().totalMemory() < targetValue) {
+        System.out.println("Loading memory with " + DEFAULT_UNIT_LOAD_SIZE 
+                           + " characters. Current usage : " 
+                           + Runtime.getRuntime().totalMemory());
+        // load some objects in the memory
+        loadObjects.add(RandomStringUtils.random(DEFAULT_UNIT_LOAD_SIZE));
+
+        // sleep for 100ms
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException ie) {}
+      }
+    }
+  }
+
+  /**
+   * A mapper that increases the JVM's heap usage to a target value configured 
+   * via {@link MemoryLoaderMapper#TARGET_VALUE} using a {@link MemoryLoader}.
+   */
+  @SuppressWarnings({"deprecation", "unchecked"})
+  static class MemoryLoaderMapper 
+  extends MapReduceBase 
+  implements org.apache.hadoop.mapred.Mapper<WritableComparable, Writable, 
+                    WritableComparable, Writable> {
+    static final String TARGET_VALUE = "map.memory-loader.target-value";
+    
+    private static MemoryLoader loader = null;
+    
+    public void map(WritableComparable key, Writable val, 
+                    OutputCollector<WritableComparable, Writable> output,
+                    Reporter reporter)
+    throws IOException {
+      assertNotNull("Mapper not configured!", loader);
+      
+      // load the memory
+      loader.load();
+      
+      // work as identity mapper
+      output.collect(key, val);
+    }
+
+    public void configure(JobConf conf) {
+      loader = new MemoryLoader(conf.getLong(TARGET_VALUE, -1));
+    }
+  }
+
+  /** 
+   * A reducer that increases the JVM's heap usage to a target value configured 
+   * via {@link MemoryLoaderReducer#TARGET_VALUE} using a {@link MemoryLoader}.
+   */
+  @SuppressWarnings({"deprecation", "unchecked"})
+  static class MemoryLoaderReducer extends MapReduceBase 
+  implements org.apache.hadoop.mapred.Reducer<WritableComparable, Writable, 
+                     WritableComparable, Writable> {
+    static final String TARGET_VALUE = "reduce.memory-loader.target-value";
+    private static MemoryLoader loader = null;
+    
+    public void reduce(WritableComparable key, Iterator<Writable> val, 
+                       OutputCollector<WritableComparable, Writable> output,
+                       Reporter reporter)
+    throws IOException {
+      assertNotNull("Reducer not configured!", loader);
+      
+      // load the memory
+      loader.load();
+      
+      // work as identity reducer
+      output.collect(key, key);
+    }
+
+    public void configure(JobConf conf) {
+      loader = new MemoryLoader(conf.getLong(TARGET_VALUE, -1));
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  private long getTaskCounterUsage (JobClient client, JobID id, int numReports,
+                                    int taskId, boolean isMap) 
+  throws Exception {
+    TaskReport[] reports = null;
+    if (isMap) {
+      reports = client.getMapTaskReports(id);
+    } else {
+      reports = client.getReduceTaskReports(id);
+    }
+    
+    assertNotNull("No reports found for " + (isMap? "map" : "reduce") + " tasks" 
+                  + "' in job " + id, reports);
+    // make sure that the total number of reports match the expected
+    assertEquals("Mismatch in task id", numReports, reports.length);
+    
+    Counters counters = reports[taskId].getCounters();
+    
+    return counters.getCounter(COMMITTED_HEAP_BYTES);
+  }
+
+  // set up heap options, target value for memory loader and the output 
+  // directory before running the job
+  @SuppressWarnings("deprecation")
+  private static RunningJob runHeapUsageTestJob(JobConf conf, Path testRootDir,
+                              String heapOptions, long targetMapValue,
+                              long targetReduceValue, FileSystem fs, 
+                              JobClient client, Path inDir) 
+  throws IOException {
+    // define a job
+    JobConf jobConf = new JobConf(conf);
+    
+    // configure the jobs
+    jobConf.setNumMapTasks(1);
+    jobConf.setNumReduceTasks(1);
+    jobConf.setMapperClass(MemoryLoaderMapper.class);
+    jobConf.setReducerClass(MemoryLoaderReducer.class);
+    jobConf.setInputFormat(TextInputFormat.class);
+    jobConf.setOutputKeyClass(LongWritable.class);
+    jobConf.setOutputValueClass(Text.class);
+    jobConf.setMaxMapAttempts(1);
+    jobConf.setMaxReduceAttempts(1);
+    jobConf.set(JobConf.MAPRED_TASK_JAVA_OPTS, heapOptions);
+    
+    // set the targets
+    jobConf.setLong(MemoryLoaderMapper.TARGET_VALUE, targetMapValue);
+    jobConf.setLong(MemoryLoaderReducer.TARGET_VALUE, targetReduceValue);
+    
+    // set the input directory for the job
+    FileInputFormat.setInputPaths(jobConf, inDir);
+    
+    // define job output folder
+    Path outDir = new Path(testRootDir, "out");
+    fs.delete(outDir, true);
+    FileOutputFormat.setOutputPath(jobConf, outDir);
+    
+    // run the job
+    RunningJob job = client.submitJob(jobConf);
+    job.waitForCompletion();
+    JobID jobID = job.getID();
+    assertTrue("Job " + jobID + " failed!", job.isSuccessful());
+    
+    return job;
+  }
+
+  /**
+   * Tests {@link TaskCounter}'s {@link TaskCounter.COMMITTED_HEAP_BYTES}. 
+   * The test consists of running a low-memory job which consumes less heap 
+   * memory and then running a high-memory job which consumes more heap memory, 
+   * and then ensuring that COMMITTED_HEAP_BYTES of low-memory job is smaller 
+   * than that of the high-memory job.
+   * @throws IOException
+   */
+  @SuppressWarnings("deprecation")
+  public void testHeapUsageCounter() throws Exception {
+    JobConf conf = new JobConf();
+    // create a local filesystem handle
+    FileSystem fileSystem = FileSystem.getLocal(conf);
+    
+    // define test root directories
+    File rootDir =
+      new File(System.getProperty("test.build.data", "/tmp"));
+    File testRootDir = new File(rootDir, "testHeapUsageCounter");
+    // cleanup the test root directory
+    Path testRootDirPath = new Path(testRootDir.toString());
+    fileSystem.delete(testRootDirPath, true);
+    // set the current working directory
+    fileSystem.setWorkingDirectory(testRootDirPath);
+    
+    fileSystem.deleteOnExit(testRootDirPath);
+    
+    // create a mini cluster using the local file system
+    MiniMRCluster mrCluster = 
+      new MiniMRCluster(1, fileSystem.getUri().toString(), 1);
+    
+    try {
+      conf = mrCluster.createJobConf();
+      JobClient jobClient = new JobClient(conf);
+
+      // define job input
+      File file = new File(testRootDir, "in");
+      Path inDir = new Path(file.toString());
+      // create input data
+      createWordsFile(file);
+
+      // configure and run a low memory job which will run without loading the
+      // jvm's heap
+      RunningJob lowMemJob = 
+        runHeapUsageTestJob(conf, testRootDirPath, "-Xms32m -Xmx1G", 
+                            0, 0, fileSystem, jobClient, inDir);
+      JobID lowMemJobID = lowMemJob.getID();
+      long lowMemJobMapHeapUsage = getTaskCounterUsage(jobClient, lowMemJobID, 
+                                                       1, 0, true);
+      System.out.println("Job1 (low memory job) map task heap usage: " 
+                         + lowMemJobMapHeapUsage);
+      long lowMemJobReduceHeapUsage =
+        getTaskCounterUsage(jobClient, lowMemJobID, 1, 0, false);
+      System.out.println("Job1 (low memory job) reduce task heap usage: " 
+                         + lowMemJobReduceHeapUsage);
+
+      // configure and run a high memory job which will load the jvm's heap
+      RunningJob highMemJob = 
+        runHeapUsageTestJob(conf, testRootDirPath, "-Xms32m -Xmx1G", 
+                            lowMemJobMapHeapUsage + 256*1024*1024, 
+                            lowMemJobReduceHeapUsage + 256*1024*1024,
+                            fileSystem, jobClient, inDir);
+      JobID highMemJobID = highMemJob.getID();
+
+      long highMemJobMapHeapUsage = getTaskCounterUsage(jobClient, highMemJobID,
+                                                        1, 0, true);
+      System.out.println("Job2 (high memory job) map task heap usage: " 
+                         + highMemJobMapHeapUsage);
+      long highMemJobReduceHeapUsage =
+        getTaskCounterUsage(jobClient, highMemJobID, 1, 0, false);
+      System.out.println("Job2 (high memory job) reduce task heap usage: " 
+                         + highMemJobReduceHeapUsage);
+
+      assertTrue("Incorrect map heap usage reported by the map task", 
+                 lowMemJobMapHeapUsage < highMemJobMapHeapUsage);
+
+      assertTrue("Incorrect reduce heap usage reported by the reduce task", 
+                 lowMemJobReduceHeapUsage < highMemJobReduceHeapUsage);
+    } finally {
+      // shutdown the mr cluster
+      mrCluster.shutdown();
+      try {
+        fileSystem.delete(testRootDirPath, true);
+      } catch (IOException ioe) {} 
     }
   }
 }

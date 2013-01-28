@@ -17,6 +17,8 @@
  */
 package org.apache.hadoop.hdfs.server.common;
 
+import org.apache.hadoop.hdfs.server.namenode.MetaRecoveryContext;
+
 
 /************************************
  * Some handy internal HDFS constants
@@ -37,19 +39,64 @@ public interface HdfsConstants {
     FORMAT  ("-format"),
     REGULAR ("-regular"),
     UPGRADE ("-upgrade"),
+    RECOVER ("-recover"),
+    FORCE ("-force"),
     ROLLBACK("-rollback"),
     FINALIZE("-finalize"),
-    IMPORT  ("-importCheckpoint");
+    IMPORT  ("-importCheckpoint"),
+    NONINTERACTIVE  ("-nonInteractive");
+    
+    // Used only with recovery option
+    private int force = MetaRecoveryContext.FORCE_NONE;
+    
+    // used only with format option
+    private boolean isConfirmationNeeded = true;
+    private boolean isInteractive = true;
     
     private String name = null;
     private StartupOption(String arg) {this.name = arg;}
     public String getName() {return name;}
+
+    public MetaRecoveryContext createRecoveryContext() {
+      if (!name.equals(RECOVER.name))
+        return null;
+      return new MetaRecoveryContext(force);
+    }
+
+    public void setForce(int force) {
+      this.force = force;
+    }
+    
+    public int getForce() {
+      return this.force;
+    }
+    
+    public void setConfirmationNeeded(boolean confirmationNeeded) {
+      this.isConfirmationNeeded = confirmationNeeded;
+    }
+
+    public boolean getConfirmationNeeded() {
+      return isConfirmationNeeded;
+    }
+
+    public void setInteractive(boolean interactive) {
+      this.isInteractive = interactive;
+    }
+
+    public boolean getInteractive() {
+      return isInteractive;
+    }
   }
 
   // Timeouts for communicating with DataNode for streaming writes/reads
   public static int READ_TIMEOUT = 60 * 1000;
+  public static int READ_TIMEOUT_EXTENSION = 3 * 1000;
   public static int WRITE_TIMEOUT = 8 * 60 * 1000;
   public static int WRITE_TIMEOUT_EXTENSION = 5 * 1000; //for write pipeline
+
+
+  // The lease holder for recovery initiated by the NameNode
+  public static final String NN_RECOVERY_LEASEHOLDER = "NN_Recovery";
 
 }
 

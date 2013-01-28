@@ -18,20 +18,22 @@
 package org.apache.hadoop.hdfs;
 
 import java.io.OutputStream;
+import java.security.PrivilegedExceptionAction;
+
+import junit.framework.TestCase;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.protocol.DSQuotaExceededException;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
+import org.apache.hadoop.hdfs.protocol.NSQuotaExceededException;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.tools.DFSAdmin;
+import org.apache.hadoop.hdfs.web.WebHdfsFileSystem;
 import org.apache.hadoop.io.IOUtils;
-import org.apache.hadoop.security.UnixUserGroupInformation;
-import org.apache.hadoop.hdfs.protocol.NSQuotaExceededException;
-import org.apache.hadoop.hdfs.protocol.DSQuotaExceededException;
-
-import junit.framework.TestCase;
+import org.apache.hadoop.security.UserGroupInformation;
 
 /** A class for testing quota-related commands */
 public class TestQuota extends TestCase {
@@ -58,8 +60,9 @@ public class TestQuota extends TestCase {
     final Configuration conf = new Configuration();
     // set a smaller block size so that we can test with smaller 
     // Space quotas
-    conf.set("dfs.block.size", "512");
-    conf.setBoolean("dfs.support.append", true);
+    final int DEFAULT_BLOCK_SIZE = 512;
+    conf.setLong("dfs.block.size", DEFAULT_BLOCK_SIZE);
+    conf.setBoolean("dfs.support.broken.append", true);
     final MiniDFSCluster cluster = new MiniDFSCluster(conf, 2, true, null);
     final FileSystem fs = cluster.getFileSystem();
     assertTrue("Not a HDFS: "+fs.getUri(),
@@ -241,18 +244,91 @@ public class TestQuota extends TestCase {
                  (Long.MAX_VALUE/1024/1024 + 1024) + "m", args[2]);
       
       // 17:  setQuota by a non-administrator
-      UnixUserGroupInformation.saveToConf(conf, 
-          UnixUserGroupInformation.UGI_PROPERTY_NAME, 
-          new UnixUserGroupInformation(new String[]{"userxx\n", "groupyy\n"}));
-      DFSAdmin userAdmin = new DFSAdmin(conf);
-      args[1] = "100";
-      runCommand(userAdmin, args, true);
-      runCommand(userAdmin, true, "-setSpaceQuota", "1g", args[2]);
+      final String username = "userxx";
+      UserGroupInformation ugi = 
+        UserGroupInformation.createUserForTesting(username, 
+                                                  new String[]{"groupyy"});
       
-      // 18: clrQuota by a non-administrator
-      args = new String[] {"-clrQuota", parent.toString()};
-      runCommand(userAdmin, args, true);
-      runCommand(userAdmin, true, "-clrSpaceQuota",  args[1]);      
+      final String[] args2 = args.clone(); // need final ref for doAs block
+      ugi.doAs(new PrivilegedExceptionAction<Object>() {
+        @Override
+        public Object run() throws Exception {
+          assertEquals("Not running as new user", username, 
+              UserGroupInformation.getCurrentUser().getShortUserName());
+          DFSAdmin userAdmin = new DFSAdmin(conf);
+          
+          args2[1] = "100";
+          runCommand(userAdmin, args2, true);
+          runCommand(userAdmin, true, "-setSpaceQuota", "1g", args2[2]);
+          
+          // 18: clrQuota by a non-administrator
+          String[] args3 = new String[] {"-clrQuota", parent.toString()};
+          runCommand(userAdmin, args3, true);
+          runCommand(userAdmin, true, "-clrSpaceQuota",  args3[1]); 
+          
+          return null;
+        }
+      });
+
+      // 19: clrQuota on the root directory ("/") should fail
+      runCommand(admin, true, "-clrQuota", "/");
+
+      // 20: setQuota on the root directory ("/") should succeed
+      runCommand(admin, false, "-setQuota", "1000000", "/");
+ 
+      runCommand(admin, true, "-clrQuota", "/");
+      runCommand(admin, false, "-clrSpaceQuota", "/");
+      runCommand(admin, new String[]{"-clrQuota", parent.toString()}, false);
+      runCommand(admin, false, "-clrSpaceQuota", parent.toString());
+ 
+ 
+      // 2: create directory /test/data2
+      final Path childDir2 = new Path(parent, "data2");
+      assertTrue(dfs.mkdirs(childDir2));
+
+
+      final Path childFile2 = new Path(childDir2, "datafile2");
+      final Path childFile3 = new Path(childDir2, "datafile3");
+      final long spaceQuota2 = DEFAULT_BLOCK_SIZE * replication;
+      final long fileLen2 = DEFAULT_BLOCK_SIZE;
+      // set space quota to a real low value 
+      runCommand(admin, false, "-setSpaceQuota", Long.toString(spaceQuota2), childDir2.toString());
+      // clear space quota
+      runCommand(admin, false, "-clrSpaceQuota", childDir2.toString());
+      // create a file that is greater than the size of space quota
+      DFSTestUtil.createFile(fs, childFile2, fileLen2, replication, 0);
+
+      // now set space quota again. This should succeed
+      runCommand(admin, false, "-setSpaceQuota", Long.toString(spaceQuota2), childDir2.toString());
+
+      hasException = false;
+      try {
+        DFSTestUtil.createFile(fs, childFile3, fileLen2, replication, 0);
+      } catch (DSQuotaExceededException e) {
+        hasException = true;
+      }
+      assertTrue(hasException);
+
+      // now test the same for root
+      final Path childFile4 = new Path("/", "datafile2");
+      final Path childFile5 = new Path("/", "datafile3");
+
+      runCommand(admin, true, "-clrQuota", "/");
+      runCommand(admin, false, "-clrSpaceQuota", "/");
+      // set space quota to a real low value 
+      runCommand(admin, false, "-setSpaceQuota", Long.toString(spaceQuota2), "/");
+      runCommand(admin, false, "-clrSpaceQuota", "/");
+      DFSTestUtil.createFile(fs, childFile4, fileLen2, replication, 0);
+      runCommand(admin, false, "-setSpaceQuota", Long.toString(spaceQuota2), "/");
+
+      hasException = false;
+      try {
+        DFSTestUtil.createFile(fs, childFile5, fileLen2, replication, 0);
+      } catch (DSQuotaExceededException e) {
+        hasException = true;
+      }
+      assertTrue(hasException);
+
     } finally {
       cluster.shutdown();
     }
@@ -433,7 +509,7 @@ public class TestQuota extends TestCase {
     // set a smaller block size so that we can test with smaller 
     // diskspace quotas
     conf.set("dfs.block.size", "512");
-    conf.setBoolean("dfs.support.append", true);
+    conf.setBoolean("dfs.support.broken.append", true);
     final MiniDFSCluster cluster = new MiniDFSCluster(conf, 2, true, null);
     final FileSystem fs = cluster.getFileSystem();
     assertTrue("Not a HDFS: "+fs.getUri(),
@@ -615,7 +691,196 @@ public class TestQuota extends TestCase {
       // verify increase in space
       c = dfs.getContentSummary(dstPath);
       assertEquals(c.getSpaceConsumed(), 5 * fileSpace + file2Len);
-      
+
+      // Test HDFS-2053 :
+
+      // Create directory /hdfs-2053
+      final Path quotaDir2053 = new Path("/hdfs-2053");
+      assertTrue(dfs.mkdirs(quotaDir2053));
+
+      // Create subdirectories /hdfs-2053/{A,B,C}
+      final Path quotaDir2053_A = new Path(quotaDir2053, "A");
+      assertTrue(dfs.mkdirs(quotaDir2053_A));
+      final Path quotaDir2053_B = new Path(quotaDir2053, "B");
+      assertTrue(dfs.mkdirs(quotaDir2053_B));
+      final Path quotaDir2053_C = new Path(quotaDir2053, "C");
+      assertTrue(dfs.mkdirs(quotaDir2053_C));
+
+      // Factors to vary the sizes of test files created in each subdir.
+      // The actual factors are not really important but they allow us to create
+      // identifiable file sizes per subdir, which helps during debugging.
+      int sizeFactorA = 1;
+      int sizeFactorB = 2;
+      int sizeFactorC = 4;
+
+      // Set space quota for subdirectory C
+      dfs.setQuota(quotaDir2053_C, FSConstants.QUOTA_DONT_SET,
+          (sizeFactorC + 1) * fileSpace);
+      c = dfs.getContentSummary(quotaDir2053_C);
+      assertEquals(c.getSpaceQuota(), (sizeFactorC + 1) * fileSpace);
+
+      // Create a file under subdirectory A
+      DFSTestUtil.createFile(dfs, new Path(quotaDir2053_A, "fileA"),
+          sizeFactorA * fileLen, replication, 0);
+      c = dfs.getContentSummary(quotaDir2053_A);
+      assertEquals(c.getSpaceConsumed(), sizeFactorA * fileSpace);
+
+      // Create a file under subdirectory B
+      DFSTestUtil.createFile(dfs, new Path(quotaDir2053_B, "fileB"),
+          sizeFactorB * fileLen, replication, 0);
+      c = dfs.getContentSummary(quotaDir2053_B);
+      assertEquals(c.getSpaceConsumed(), sizeFactorB * fileSpace);
+
+      // Create a file under subdirectory C (which has a space quota)
+      DFSTestUtil.createFile(dfs, new Path(quotaDir2053_C, "fileC"),
+          sizeFactorC * fileLen, replication, 0);
+      c = dfs.getContentSummary(quotaDir2053_C);
+      assertEquals(c.getSpaceConsumed(), sizeFactorC * fileSpace);
+
+      // Check space consumed for /hdfs-2053
+      c = dfs.getContentSummary(quotaDir2053);
+      assertEquals(c.getSpaceConsumed(),
+          (sizeFactorA + sizeFactorB + sizeFactorC) * fileSpace);
+
+    } finally {
+      cluster.shutdown();
+    }
+  }
+
+  private static void checkContentSummary(final ContentSummary expected,
+      final ContentSummary computed) {
+    assertEquals(expected.toString(), computed.toString());
+  }
+
+  /**
+   * Violate a space quota using files of size < 1 block. Test that
+   * block allocation conservatively assumes that for quota checking
+   * the entire space of the block is used.
+   */
+  public void testBlockAllocationAdjustUsageConservatively() throws Exception {
+    Configuration conf = new Configuration();
+    final int BLOCK_SIZE = 6 * 1024;
+    conf.set("dfs.block.size", Integer.toString(BLOCK_SIZE));
+    conf.setBoolean(DFSConfigKeys.DFS_WEBHDFS_ENABLED_KEY, true);
+    MiniDFSCluster cluster = new MiniDFSCluster(conf, 3, true, null);
+    cluster.waitActive();
+    FileSystem fs = cluster.getFileSystem();
+    DFSAdmin admin = new DFSAdmin(conf);
+
+    final String nnAddr = conf.get("dfs.http.address");
+    final String webhdfsuri = WebHdfsFileSystem.SCHEME  + "://" + nnAddr;
+    System.out.println("webhdfsuri=" + webhdfsuri);
+    final FileSystem webhdfs = new Path(webhdfsuri).getFileSystem(conf);
+
+    try {
+      Path dir = new Path("/test");
+      Path file1 = new Path("/test/test1");
+      Path file2 = new Path("/test/test2");
+      boolean exceededQuota = false;
+      final int QUOTA_SIZE = 3 * BLOCK_SIZE; // total usage including repl.
+      final int FILE_SIZE = BLOCK_SIZE / 2; 
+      ContentSummary c;
+
+      // Create the directory and set the quota
+      assertTrue(fs.mkdirs(dir));
+      runCommand(admin, false, "-setSpaceQuota", Integer.toString(QUOTA_SIZE),
+		 dir.toString());
+    
+      // Creating one file should use half the quota
+      DFSTestUtil.createFile(fs, file1, FILE_SIZE, (short)3, 1L);
+      DFSTestUtil.waitReplication(fs, file1, (short)3);
+      c = fs.getContentSummary(dir);
+      checkContentSummary(c, webhdfs.getContentSummary(dir));
+      assertEquals("Quota is half consumed", QUOTA_SIZE / 2,
+		   c.getSpaceConsumed());
+
+      // We can not create the 2nd file because even though the total
+      // spaced used by two files (2 * 3 * 512/2) would fit within the
+      // quota (3 * 512) when a block for a file is created the space
+      // used is adjusted conservatively (3 * block size, ie assumes a
+      // full block is written) which will violate the quota (3 *
+      // block size) since we've already used half the quota for the
+      // first file.
+      try {
+	DFSTestUtil.createFile(fs, file2, FILE_SIZE, (short)3, 1L);
+      } catch (QuotaExceededException e) {
+	exceededQuota = true;
+      }
+      assertTrue("Quota not exceeded", exceededQuota);
+    } finally {
+      cluster.shutdown();
+    }
+  }
+
+  /**
+   * Like the previous test but create many files. This covers bugs
+   * where the quota adjustment is incorrect but it takes many files
+   * to accrue a big enough accounting error to violate the quota.
+   */
+  public void testMultipleFilesSmallerThanOneBlock() throws Exception {
+    Configuration conf = new Configuration();
+    final int BLOCK_SIZE = 6 * 1024;
+    conf.set("dfs.block.size", Integer.toString(BLOCK_SIZE));
+    conf.setBoolean(DFSConfigKeys.DFS_WEBHDFS_ENABLED_KEY, true);
+    MiniDFSCluster cluster = new MiniDFSCluster(conf, 3, true, null);
+    cluster.waitActive();
+    FileSystem fs = cluster.getFileSystem();
+    DFSAdmin admin = new DFSAdmin(conf);
+
+    final String nnAddr = conf.get("dfs.http.address");
+    final String webhdfsuri = WebHdfsFileSystem.SCHEME  + "://" + nnAddr;
+    System.out.println("webhdfsuri=" + webhdfsuri);
+    final FileSystem webhdfs = new Path(webhdfsuri).getFileSystem(conf);
+
+    try {
+      Path dir = new Path("/test");
+      boolean exceededQuota = false;
+      ContentSummary c;
+      //   1kb file
+      //   6kb block
+      // 192kb quota
+      final int FILE_SIZE = 1024; 
+      final int QUOTA_SIZE = 32 * (int)fs.getDefaultBlockSize();
+      assertEquals(6 * 1024, fs.getDefaultBlockSize());
+      assertEquals(192 * 1024, QUOTA_SIZE);
+
+      // Create the dir and set the quota. We need to enable the quota before
+      // writing the files as setting the quota afterwards will over-write 
+      // the cached disk space used for quota verification with the actual
+      // amount used as calculated by INode#spaceConsumedInTree.
+      assertTrue(fs.mkdirs(dir));
+      runCommand(admin, false, "-setSpaceQuota", Integer.toString(QUOTA_SIZE),
+		 dir.toString());
+
+      // We can create at most 59 files because block allocation is
+      // conservative and initially assumes a full block is used, so we
+      // need to leave at least 3 * BLOCK_SIZE free space when allocating 
+      // the last block: (58 * 3 * 1024) + (3 * 6 * 1024) = 192kb
+      for (int i = 0; i < 59; i++) {
+	Path file = new Path("/test/test" + i);
+	DFSTestUtil.createFile(fs, file, FILE_SIZE, (short)3, 1L);
+	DFSTestUtil.waitReplication(fs, file, (short)3);
+      }
+
+      // Should account for all 59 files (almost QUOTA_SIZE)
+      c = fs.getContentSummary(dir);
+      checkContentSummary(c, webhdfs.getContentSummary(dir));
+      assertEquals("Invalid space consumed", 
+		   59 * FILE_SIZE * 3, 
+		   c.getSpaceConsumed());
+      assertEquals("Invalid space consumed",
+		   QUOTA_SIZE - (59 * FILE_SIZE * 3),
+		   3 * (fs.getDefaultBlockSize() - FILE_SIZE));
+
+      // Now check that trying to create another file violates the quota
+      try {
+	Path file = new Path("/test/test59");
+	DFSTestUtil.createFile(fs, file, FILE_SIZE, (short) 3, 1L);
+	DFSTestUtil.waitReplication(fs, file, (short) 3);
+      } catch (QuotaExceededException e) {
+	exceededQuota = true;
+      }
+      assertTrue("Quota not exceeded", exceededQuota);
     } finally {
       cluster.shutdown();
     }

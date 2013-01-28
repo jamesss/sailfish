@@ -31,11 +31,58 @@
   ordering of the filters.</description>
 </property>
 
+ <property>
+  <name>hadoop.security.group.mapping</name>
+  <value>org.apache.hadoop.security.ShellBasedUnixGroupsMapping</value>
+  <description>Class for user to group mapping (get groups for a given user)
+  </description>
+</property>
+
 <property>
   <name>hadoop.security.authorization</name>
   <value>false</value>
   <description>Is service-level authorization enabled?</description>
 </property>
+
+<property>
+  <name>hadoop.security.authentication</name>
+  <value>simple</value>
+  <description>Possible values are simple (no authentication), and kerberos
+  </description>
+</property>
+
+<property>
+  <name>hadoop.security.token.service.use_ip</name>
+  <value>true</value>
+  <description>Controls whether tokens always use IP addresses.  DNS changes
+  will not be detected if this option is enabled.  Existing client connections
+  that break will always reconnect to the IP of the original host.  New clients
+  will connect to the host's new IP but fail to locate a token.  Disabling
+  this option will allow existing and new clients to detect an IP change and
+  continue to locate the new host's token.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.security.use-weak-http-crypto</name>
+  <value>false</value>
+  <description>If enabled, use KSSL to authenticate HTTP connections to the
+  NameNode. Due to a bug in JDK6, using KSSL requires one to configure
+  Kerberos tickets to use encryption types that are known to be
+  cryptographically weak. If disabled, SPNEGO will be used for HTTP
+  authentication, which supports stronger encryption types.
+  </description>
+</property>
+
+<!--
+<property>
+  <name>hadoop.security.service.user.name.key</name>
+  <value></value>
+  <description>Name of the kerberos principal of the user that owns
+  a given service daemon
+  </description>
+</property>
+-->
 
 <!--- logging properties -->
 
@@ -78,7 +125,7 @@
 
 <property>
   <name>io.compression.codecs</name>
-  <value>org.apache.hadoop.io.compress.DefaultCodec,org.apache.hadoop.io.compress.GzipCodec,org.apache.hadoop.io.compress.BZip2Codec</value>
+  <value>org.apache.hadoop.io.compress.DefaultCodec,org.apache.hadoop.io.compress.GzipCodec,org.apache.hadoop.io.compress.BZip2Codec,org.apache.hadoop.io.compress.SnappyCodec</value>
   <description>A list of the compression codec classes that can be used 
                for compression/decompression.</description>
 </property>
@@ -148,6 +195,11 @@
 <property>
   <name>fs.hsftp.impl</name>
   <value>org.apache.hadoop.hdfs.HsftpFileSystem</value>
+</property>
+
+<property>
+  <name>fs.webhdfs.impl</name>
+  <value>org.apache.hadoop.hdfs.web.WebHdfsFileSystem</value>
 </property>
 
 <property>
@@ -435,6 +487,94 @@
   </description>
 </property>
 
+<property>
+  <name>hadoop.security.uid.cache.secs</name>
+  <value>14400</value>
+  <description> NativeIO maintains a cache from UID to UserName. This is
+  the timeout for an entry in that cache. </description>
+</property>
 
+<!-- HTTP web-consoles Authentication -->
+
+<property>
+  <name>hadoop.http.authentication.type</name>
+  <value>simple</value>
+  <description>
+    Defines authentication used for Oozie HTTP endpoint.
+    Supported values are: simple | kerberos | #AUTHENTICATION_HANDLER_CLASSNAME#
+  </description>
+</property>
+
+<property>
+  <name>hadoop.http.authentication.token.validity</name>
+  <value>36000</value>
+  <description>
+    Indicates how long (in seconds) an authentication token is valid before it has
+    to be renewed.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.http.authentication.signature.secret.file</name>
+  <value>${user.home}/hadoop-http-auth-signature-secret</value>
+  <description>
+    The signature secret for signing the authentication tokens.
+    If not set a random secret is generated at startup time.
+    The same secret should be used for JT/NN/DN/TT configurations.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.http.authentication.cookie.domain</name>
+  <value></value>
+  <description>
+    The domain to use for the HTTP cookie that stores the authentication token.
+    In order to authentiation to work correctly across all Hadoop nodes web-consoles
+    the domain must be correctly set.
+    IMPORTANT: when using IP addresses, browsers ignore cookies with domain settings.
+    For this setting to work properly all nodes in the cluster must be configured
+    to generate URLs with hostname.domain names on it.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.http.authentication.simple.anonymous.allowed</name>
+  <value>true</value>
+  <description>
+    Indicates if anonymous requests are allowed when using 'simple' authentication.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.http.authentication.kerberos.principal</name>
+  <value>HTTP/localhost@LOCALHOST</value>
+  <description>
+    Indicates the Kerberos principal to be used for HTTP endpoint.
+    The principal MUST start with 'HTTP/' as per Kerberos HTTP SPNEGO specification.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.http.authentication.kerberos.keytab</name>
+  <value>${user.home}/hadoop.keytab</value>
+  <description>
+    Location of the keytab file with the credentials for the principal.
+    Referring to the same keytab file Oozie uses for its Kerberos credentials for Hadoop.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.relaxed.worker.version.check</name>
+  <value>false</value>
+  <description>
+    By default datanodes refuse to connect to namenodes if their build
+    revision (svn revision) do not match, and tasktrackers refuse to
+    connect to jobtrackers if their build version (version, revision,
+    user, and source checksum) do not match. This option changes the
+    behavior of hadoop workers to only check for a version match (eg
+    "1.0.2") but ignore the other build fields (revision, user, and
+    source checksum).
+  </description>
+</property>
 
 </configuration>

@@ -35,9 +35,17 @@ import org.apache.hadoop.mapreduce.RecordWriter;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.TaskID;
 import org.apache.hadoop.mapreduce.TaskInputOutputContext;
+import org.apache.hadoop.mapreduce.security.TokenCache;
 
 /** A base class for {@link OutputFormat}s that read from {@link FileSystem}s.*/
 public abstract class FileOutputFormat<K, V> extends OutputFormat<K, V> {
+  
+  protected static final String BASE_OUTPUT_NAME = "mapreduce.output.basename";
+  protected static final String PART = "part";
+
+  public static enum Counter { 
+    BYTES_WRITTEN
+  }
 
   /** Construct output file names so that, when an output directory listing is
    * sorted lexicographically, positions correspond to output partitions.*/
@@ -119,6 +127,12 @@ public abstract class FileOutputFormat<K, V> extends OutputFormat<K, V> {
     if (outDir == null) {
       throw new InvalidJobConfException("Output directory not set.");
     }
+    
+    // get delegation token for outDir's file system
+    TokenCache.obtainTokensForNamenodes(job.getCredentials(), 
+                                        new Path[] {outDir}, 
+                                        job.getConfiguration());
+
     if (outDir.getFileSystem(job.getConfiguration()).exists(outDir)) {
       throw new FileAlreadyExistsException("Output directory " + outDir + 
                                            " already exists");
@@ -252,8 +266,22 @@ public abstract class FileOutputFormat<K, V> extends OutputFormat<K, V> {
                                  String extension) throws IOException{
     FileOutputCommitter committer = 
       (FileOutputCommitter) getOutputCommitter(context);
-    return new Path(committer.getWorkPath(), getUniqueFile(context, "part", 
-                                                           extension));
+    return new Path(committer.getWorkPath(), getUniqueFile(context, 
+        getOutputName(context), extension));
+  }
+  
+  /**
+   * Get the base output name for the output file.
+   */
+  protected static String getOutputName(JobContext job) {
+    return job.getConfiguration().get(BASE_OUTPUT_NAME, PART);
+  }
+
+  /**
+   * Set the base output name for output file to be created.
+   */
+  protected static void setOutputName(JobContext job, String name) {
+    job.getConfiguration().set(BASE_OUTPUT_NAME, name);
   }
 
   public synchronized 

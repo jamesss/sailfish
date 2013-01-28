@@ -23,12 +23,20 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
-import java.net.UnknownHostException;
+
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLSession;
 
+import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenRenewer;
+import org.apache.hadoop.hdfs.tools.DelegationTokenFetcher;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.security.SecurityUtil;
+import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSelector;
 
 /** An implementation of a protocol for accessing filesystems over HTTPS.
  * The following implementation provides a limited, read-only interface
@@ -37,40 +45,41 @@ import org.apache.hadoop.conf.Configuration;
  * @see org.apache.hadoop.hdfs.server.namenode.FileDataServlet
  */
 public class HsftpFileSystem extends HftpFileSystem {
+  public static final Text TOKEN_KIND = new Text("HSFTP delegation");
+
+  private static final DelegationTokenRenewer<HsftpFileSystem> dtRenewer
+      = new DelegationTokenRenewer<HsftpFileSystem>(HsftpFileSystem.class);
+  private static final HsftpDelegationTokenSelector hftpTokenSelector =
+      new HsftpDelegationTokenSelector();
 
   @Override
   public void initialize(URI name, Configuration conf) throws IOException {
     super.initialize(name, conf);
-    setupSsl(conf);
+    DelegationTokenFetcher.setupSsl(conf);
   }
 
-  /** Set up SSL resources */
-  private static void setupSsl(Configuration conf) {
-    Configuration sslConf = new Configuration(false);
-    sslConf.addResource(conf.get("dfs.https.client.keystore.resource",
-        "ssl-client.xml"));
-    System.setProperty("javax.net.ssl.trustStore", sslConf.get(
-        "ssl.client.truststore.location", ""));
-    System.setProperty("javax.net.ssl.trustStorePassword", sslConf.get(
-        "ssl.client.truststore.password", ""));
-    System.setProperty("javax.net.ssl.trustStoreType", sslConf.get(
-        "ssl.client.truststore.type", "jks"));
-    System.setProperty("javax.net.ssl.keyStore", sslConf.get(
-        "ssl.client.keystore.location", ""));
-    System.setProperty("javax.net.ssl.keyStorePassword", sslConf.get(
-        "ssl.client.keystore.password", ""));
-    System.setProperty("javax.net.ssl.keyPassword", sslConf.get(
-        "ssl.client.keystore.keypassword", ""));
-    System.setProperty("javax.net.ssl.keyStoreType", sslConf.get(
-        "ssl.client.keystore.type", "jks"));
+
+  @Override
+  protected int getDefaultPort() {
+    return getConf().getInt(DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_KEY,
+        DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_DEFAULT);
+  }
+
+  /**
+   * Return the underlying protocol that is used to talk to the namenode.
+   */
+  protected String getUnderlyingProtocol() {
+    return "https";
   }
 
   @Override
   protected HttpURLConnection openConnection(String path, String query)
       throws IOException {
     try {
-      final URL url = new URI("https", null, pickOneAddress(nnAddr.getHostName()),
-          nnAddr.getPort(), path, query, null).toURL();
+      query = updateQuery(query);
+      final URL url = new URI(getUnderlyingProtocol(), null, 
+			      nnAddr.getHostName(),
+			      nnAddr.getPort(), path, query, null).toURL();
       HttpsURLConnection conn = (HttpsURLConnection)url.openConnection();
       // bypass hostname verification
       conn.setHostnameVerifier(new DummyHostnameVerifier());
@@ -80,24 +89,38 @@ public class HsftpFileSystem extends HftpFileSystem {
     }
   }
 
-  @Override
-  public URI getUri() {
-    try {
-      return new URI("hsftp", null, pickOneAddress(nnAddr.getHostName()), nnAddr.getPort(),
-                     null, null, null);
-    } catch (URISyntaxException e) {
-      return null;
-    } catch (UnknownHostException e) {
-      return null;
-    }
-  }
-
   /**
    * Dummy hostname verifier that is used to bypass hostname checking
    */
   protected static class DummyHostnameVerifier implements HostnameVerifier {
     public boolean verify(String hostname, SSLSession session) {
       return true;
+    }
+  }
+
+  protected Token<DelegationTokenIdentifier> selectHftpDelegationToken() {
+    Text serviceName = SecurityUtil.buildTokenService(nnAddr);
+    return hftpTokenSelector.selectToken(serviceName, ugi.getTokens());      
+  }
+  
+  @InterfaceAudience.Private
+  public static class TokenManager extends HftpFileSystem.TokenManager {
+
+    @Override
+    public boolean handleKind(Text kind) {
+      return kind.equals(TOKEN_KIND);
+    }
+
+    protected String getUnderlyingProtocol() {
+      return "https";
+    }
+  }
+  
+  private static class HsftpDelegationTokenSelector
+  extends AbstractDelegationTokenSelector<DelegationTokenIdentifier> {
+
+    public HsftpDelegationTokenSelector() {
+      super(TOKEN_KIND);
     }
   }
 

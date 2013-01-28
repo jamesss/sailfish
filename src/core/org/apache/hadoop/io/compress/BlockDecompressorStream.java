@@ -38,9 +38,10 @@ public class BlockDecompressorStream extends DecompressorStream {
    * @param in input stream
    * @param decompressor decompressor to use
    * @param bufferSize size of buffer
+ * @throws IOException
    */
   public BlockDecompressorStream(InputStream in, Decompressor decompressor, 
-                                 int bufferSize) {
+                                 int bufferSize) throws IOException {
     super(in, decompressor, bufferSize);
   }
   
@@ -49,12 +50,13 @@ public class BlockDecompressorStream extends DecompressorStream {
    * 
    * @param in input stream
    * @param decompressor decompressor to use
+ * @throws IOException
    */
-  public BlockDecompressorStream(InputStream in, Decompressor decompressor) {
+  public BlockDecompressorStream(InputStream in, Decompressor decompressor) throws IOException {
     super(in, decompressor);
   }
 
-  protected BlockDecompressorStream(InputStream in) {
+  protected BlockDecompressorStream(InputStream in) throws IOException {
     super(in);
   }
 
@@ -79,7 +81,9 @@ public class BlockDecompressorStream extends DecompressorStream {
         }
       }
       if (decompressor.needsInput()) {
-        getCompressedData();
+        int m = getCompressedData();
+        // Send the read data to the decompressor
+        decompressor.setInput(buffer, 0, m);
       }
     }
     
@@ -89,10 +93,10 @@ public class BlockDecompressorStream extends DecompressorStream {
     return n;
   }
 
-  protected void getCompressedData() throws IOException {
+  protected int getCompressedData() throws IOException {
     checkStream();
 
-    // Get the size of the compressed chunk
+    // Get the size of the compressed chunk (always non-negative)
     int len = rawReadInt();
 
     // Read len bytes from underlying stream 
@@ -103,13 +107,12 @@ public class BlockDecompressorStream extends DecompressorStream {
     while (n < len) {
       int count = in.read(buffer, off + n, len - n);
       if (count < 0) {
-        throw new EOFException();
+        throw new EOFException("Unexpected end of block in input stream");
       }
       n += count;
     }
     
-    // Send the read data to the decompressor
-    decompressor.setInput(buffer, 0, len);
+    return len;
   }
 
   public void resetState() throws IOException {

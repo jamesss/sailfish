@@ -22,6 +22,10 @@ package org.apache.hadoop.metrics.spi;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.metrics.MetricsException;
 import org.apache.hadoop.metrics.MetricsRecord;
 import org.apache.hadoop.metrics.spi.AbstractMetricsContext.TagMap;
 
@@ -29,7 +33,11 @@ import org.apache.hadoop.metrics.spi.AbstractMetricsContext.TagMap;
  * An implementation of MetricsRecord.  Keeps a back-pointer to the context
  * from which it was created, and delegates back to it on <code>update</code>
  * and <code>remove()</code>.
+ * @deprecated in favor of <code>org.apache.hadoop.metrics2</code> usage.
  */
+@Deprecated
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
 public class MetricsRecordImpl implements MetricsRecord {
     
   private TagMap tagTable = new TagMap();

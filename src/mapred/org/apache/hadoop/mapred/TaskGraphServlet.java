@@ -19,11 +19,13 @@ package org.apache.hadoop.mapred;
 
 import java.io.IOException;
 import java.io.PrintWriter;
-
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+
+import org.apache.hadoop.mapred.JSPUtil.JobWithViewAccessCheck;
+import org.apache.hadoop.security.UserGroupInformation;
 
 /** The servlet that outputs svg graphics for map / reduce task
  *  statuses
@@ -52,24 +54,31 @@ public class TaskGraphServlet extends HttpServlet {
 
     response.setContentType("image/svg+xml");
 
-    JobTracker tracker = 
+    final JobTracker tracker = 
       (JobTracker) getServletContext().getAttribute("job.tracker");
     
     String jobIdStr = request.getParameter("jobid");
     if(jobIdStr == null)
       return;
-    JobID jobId = JobID.forName(jobIdStr);
+    final JobID jobId = JobID.forName(jobIdStr);
+
+    // verify if user has view access for this job
+    JobWithViewAccessCheck myJob = JSPUtil.checkAccessAndGetJob(
+        tracker, jobId, request, response);
+    if (!myJob.isViewJobAllowed()) {
+      return;// user is not authorized to view this job
+    }
 
     final boolean isMap = "map".equalsIgnoreCase(request.getParameter("type"));
     final TaskReport[] reports = isMap? tracker.getMapTaskReports(jobId) 
                                       : tracker.getReduceTaskReports(jobId);
-    if(reports == null || reports.length == 0) {
+    if(reports == null) {
       return;
     }
 
     final int numTasks = reports.length;     
     int tasksPerBar = (int)Math.ceil(numTasks / 600d);
-    int numBars = (int) Math.ceil((double)numTasks / tasksPerBar);
+    int numBars = (numTasks==0)?600:(int) Math.ceil((double)numTasks / tasksPerBar);
     int w = Math.max(600, numBars);
     int barWidth = Math.min(10,  w / numBars); //min 1px, max 10px
     int barsPerNotch = (int)Math.ceil(10d / barWidth);

@@ -18,6 +18,7 @@
 package org.apache.hadoop.hdfs.protocol;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.DFSConfigKeys;
 
 /************************************
  * Some handy constants
@@ -25,9 +26,6 @@ import org.apache.hadoop.conf.Configuration;
  ************************************/
 public interface FSConstants {
   public static int MIN_BLOCKS_FOR_WRITE = 5;
-
-  // Chunk the block Invalidate message
-  public static final int BLOCK_INVALIDATE_CHUNK = 100;
 
   // Long that indicates "leave current quota unchanged"
   public static final long QUOTA_DONT_SET = Long.MAX_VALUE;
@@ -52,7 +50,7 @@ public interface FSConstants {
   //Used for writing header etc.
   public static final int SMALL_BUFFER_SIZE = Math.min(BUFFER_SIZE/2, 512);
   //TODO mb@media-style.com: should be conf injected?
-  public static final long DEFAULT_BLOCK_SIZE = 64 * 1024 * 1024;
+  public static final long DEFAULT_BLOCK_SIZE = DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT;
   public static final int DEFAULT_DATA_SOCKET_SIZE = 128 * 1024;
 
   public static final int SIZE_OF_INTEGER = Integer.SIZE / Byte.SIZE;
@@ -80,7 +78,8 @@ public interface FSConstants {
   // Version is reflected in the data storage file.
   // Versions are negative.
   // Decrement LAYOUT_VERSION to define a new version.
-  public static final int LAYOUT_VERSION = -18;
+  public static final int LAYOUT_VERSION = -32;
   // Current version: 
-  // Support disk space quotas
+  // -32: to handle editlog opcode conflicts with 0.20.203 during upgrades and
+  // to disallow upgrade to release 0.21.
 }

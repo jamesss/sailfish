@@ -25,6 +25,7 @@ import java.util.List;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.permission.PermissionStatus;
+import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.Block;
 
 /**
@@ -95,7 +96,7 @@ class INodeDirectory extends INode {
   }
   
   INode getChild(String name) {
-    return getChildINode(string2Bytes(name));
+    return getChildINode(DFSUtil.string2Bytes(name));
   }
 
   private INode getChildINode(byte[] name) {
@@ -238,6 +239,23 @@ class INodeDirectory extends INode {
   }
 
   /**
+   * Given a child's name, return the index of the next child
+   * 
+   * @param name a child's name
+   * @return the index of the next child
+   */
+  int nextChild(byte[] name) {
+    if (name.length == 0) { // empty name
+      return 0;
+    }
+    int nextPos = Collections.binarySearch(children, name) + 1;
+    if (nextPos >= 0) {
+      return nextPos;
+    }
+    return -nextPos;
+  }
+  
+  /**
    * Equivalent to addNode(path, newNode, false).
    * @see #addNode(String, INode, boolean)
    */
@@ -315,11 +333,31 @@ class INodeDirectory extends INode {
 
   /** {@inheritDoc} */
   long[] computeContentSummary(long[] summary) {
+    // Walk through the children of this node, using a new summary array
+    // for the (sub)tree rooted at this node
+    assert 4 == summary.length;
+    long[] subtreeSummary = new long[]{0,0,0,0};
     if (children != null) {
       for (INode child : children) {
-        child.computeContentSummary(summary);
+        child.computeContentSummary(subtreeSummary);
       }
     }
+    if (this instanceof INodeDirectoryWithQuota) {
+      // Warn if the cached and computed diskspace values differ
+      INodeDirectoryWithQuota node = (INodeDirectoryWithQuota)this;
+      long space = node.diskspaceConsumed();
+      assert -1 == node.getDsQuota() || space == subtreeSummary[3];
+      if (-1 != node.getDsQuota() && space != subtreeSummary[3]) {
+        NameNode.LOG.warn("Inconsistent diskspace for directory "
+          +getLocalName()+". Cached: "+space+" Computed: "+subtreeSummary[3]);
+      }
+    }
+
+    // update the passed summary array with the values for this node's subtree
+    for (int i = 0; i < summary.length; i++) {
+      summary[i] += subtreeSummary[i];
+    }
+
     summary[2]++;
     return summary;
   }

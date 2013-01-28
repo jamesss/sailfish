@@ -35,10 +35,6 @@ import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.NodeType;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.StartupOption;
 import org.apache.hadoop.fs.FileUtil;
-import org.apache.hadoop.util.StringUtils;
-import org.apache.hadoop.util.VersionInfo;
-
-
 
 /**
  * Storage information file.
@@ -73,6 +69,9 @@ public abstract class Storage extends StorageInfo {
   /* this should be removed when LAST_UPGRADABLE_LV goes beyond -13.
    * any upgrade code that uses this constant should also be removed. */
   public static final int PRE_GENERATIONSTAMP_LAYOUT_VERSION = -13;
+  
+  /** Layout versions of 203 release */
+  public static final int[] LAYOUT_VERSIONS_203 = {-19, -31};
   
   private   static final String STORAGE_FILE_LOCK     = "in_use.lock";
   protected static final String STORAGE_FILE_VERSION  = "VERSION";
@@ -295,30 +294,119 @@ public abstract class Storage extends StorageInfo {
         throw new IOException("Cannot create directory " + curDir);
     }
 
+    /**
+     * Directory {@code current} contains latest files defining
+     * the file system meta-data.
+     * 
+     * @return the directory path
+     */
     public File getCurrentDir() {
       return new File(root, STORAGE_DIR_CURRENT);
     }
+
+    /**
+     * File {@code VERSION} contains the following fields:
+     * <ol>
+     * <li>node type</li>
+     * <li>layout version</li>
+     * <li>namespaceID</li>
+     * <li>fs state creation time</li>
+     * <li>other fields specific for this node type</li>
+     * </ol>
+     * The version file is always written last during storage directory updates.
+     * The existence of the version file indicates that all other files have
+     * been successfully written in the storage directory, the storage is valid
+     * and does not need to be recovered.
+     * 
+     * @return the version file path
+     */
     public File getVersionFile() {
       return new File(new File(root, STORAGE_DIR_CURRENT), STORAGE_FILE_VERSION);
     }
+
+    /**
+     * File {@code VERSION} from the {@code previous} directory.
+     * 
+     * @return the previous version file path
+     */
     public File getPreviousVersionFile() {
       return new File(new File(root, STORAGE_DIR_PREVIOUS), STORAGE_FILE_VERSION);
     }
+
+    /**
+     * Directory {@code previous} contains the previous file system state,
+     * which the system can be rolled back to.
+     * 
+     * @return the directory path
+     */
     public File getPreviousDir() {
       return new File(root, STORAGE_DIR_PREVIOUS);
     }
+
+    /**
+     * {@code previous.tmp} is a transient directory, which holds
+     * current file system state while the new state is saved into the new
+     * {@code current} during upgrade.
+     * If the saving succeeds {@code previous.tmp} will be moved to
+     * {@code previous}, otherwise it will be renamed back to 
+     * {@code current} by the recovery procedure during startup.
+     * 
+     * @return the directory path
+     */
     public File getPreviousTmp() {
       return new File(root, STORAGE_TMP_PREVIOUS);
     }
+
+    /**
+     * {@code removed.tmp} is a transient directory, which holds
+     * current file system state while the previous state is moved into
+     * {@code current} during rollback.
+     * If the moving succeeds {@code removed.tmp} will be removed,
+     * otherwise it will be renamed back to 
+     * {@code current} by the recovery procedure during startup.
+     * 
+     * @return the directory path
+     */
     public File getRemovedTmp() {
       return new File(root, STORAGE_TMP_REMOVED);
     }
+
+    /**
+     * {@code finalized.tmp} is a transient directory, which holds
+     * the {@code previous} file system state while it is being removed
+     * in response to the finalize request.
+     * Finalize operation will remove {@code finalized.tmp} when completed,
+     * otherwise the removal will resume upon the system startup.
+     * 
+     * @return the directory path
+     */
     public File getFinalizedTmp() {
       return new File(root, STORAGE_TMP_FINALIZED);
     }
+
+    /**
+     * {@code lastcheckpoint.tmp} is a transient directory, which holds
+     * current file system state while the new state is saved into the new
+     * {@code current} during regular namespace updates.
+     * If the saving succeeds {@code lastcheckpoint.tmp} will be moved to
+     * {@code previous.checkpoint}, otherwise it will be renamed back to 
+     * {@code current} by the recovery procedure during startup.
+     * 
+     * @return the directory path
+     */
     public File getLastCheckpointTmp() {
       return new File(root, STORAGE_TMP_LAST_CKPT);
     }
+
+    /**
+     * {@code previous.checkpoint} is a directory, which holds the previous
+     * (before the last save) state of the storage directory.
+     * The directory is created as a reference only, it does not play role
+     * in state recovery procedures, and is recycled automatically, 
+     * but it may be useful for manual recovery of a stale state of the system.
+     * 
+     * @return the directory path
+     */
     public File getPreviousCheckpoint() {
       return new File(root, STORAGE_PREVIOUS_CKPT);
     }
@@ -329,8 +417,9 @@ public abstract class Storage extends StorageInfo {
      * @param startOpt a startup option.
      *  
      * @return state {@link StorageState} of the storage directory 
-     * @throws {@link InconsistentFSStateException} if directory state is not 
-     * consistent and cannot be recovered 
+     * @throws InconsistentFSStateException if directory state is not 
+     * consistent and cannot be recovered.
+     * @throws IOException
      */
     public StorageState analyzeStorage(StartupOption startOpt) throws IOException {
       assert root != null : "root is null";
@@ -519,8 +608,12 @@ public abstract class Storage extends StorageInfo {
      * @throws IOException if locking fails.
      */
     FileLock tryLock() throws IOException {
+      boolean deletionHookAdded = false;
       File lockF = new File(root, STORAGE_FILE_LOCK);
-      lockF.deleteOnExit();
+      if (!lockF.exists()) {
+        lockF.deleteOnExit();
+        deletionHookAdded = true;
+      }
       RandomAccessFile file = new RandomAccessFile(lockF, "rws");
       FileLock res = null;
       try {
@@ -529,9 +622,15 @@ public abstract class Storage extends StorageInfo {
         file.close();
         return null;
       } catch(IOException e) {
-        LOG.info(StringUtils.stringifyException(e));
+        LOG.error("Cannot create lock on " + lockF, e);
         file.close();
         throw e;
+      }
+      if (res != null && !deletionHookAdded) {
+        // If the file existed prior to our startup, we didn't
+        // call deleteOnExit above. But since we successfully locked
+        // the dir, we can take care of cleaning it up.
+        lockF.deleteOnExit();
       }
       return res;
     }
@@ -735,10 +834,6 @@ public abstract class Storage extends StorageInfo {
     return false;
   }
 
-  public static String getBuildVersion() {
-    return VersionInfo.getRevision();
-  }
-
   public static String getRegistrationID(StorageInfo storage) {
     return "NS-" + Integer.toString(storage.getNamespaceID())
       + "-" + Integer.toString(storage.getLayoutVersion())
@@ -759,5 +854,14 @@ public abstract class Storage extends StorageInfo {
     org.apache.hadoop.io.UTF8.writeString(file, "");
     file.writeBytes(messageForPreUpgradeVersion);
     file.getFD().sync();
+  }
+  
+  public static boolean is203LayoutVersion(int layoutVersion) {
+    for (int lv : LAYOUT_VERSIONS_203) {
+      if (lv == layoutVersion) {
+        return true;
+      }
+    }
+    return false;
   }
 }

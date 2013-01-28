@@ -25,6 +25,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.util.ToolRunner;
 
 /**
  * This class tests if hadoopStreaming returns Exception 
@@ -75,8 +76,31 @@ public class TestStreamingFailure extends TestStreaming
     } catch(Exception e) {
       // Expecting an exception
     } finally {
-      OUTPUT_DIR.getAbsoluteFile().delete();
+      try {
+        FileUtil.fullyDelete(OUTPUT_DIR.getAbsoluteFile());
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
     }
+  }
+  
+  public void testStreamingFailureForFailedProcess() throws Exception {
+    int ret = 0;
+    try {
+      createInput();
+      String[] args = {
+          "-input", INPUT_FILE.getAbsolutePath(),
+          "-output", OUTPUT_DIR.getAbsolutePath(),
+          "-mapper", "/bin/ls dsdsdsds-does-not-exist",
+          "-jobconf", "stream.tmpdir="+System.getProperty("test.build.data",
+              "/tmp"),
+      };
+      ret = ToolRunner.run(new StreamJob(), args);
+    } finally {
+      INPUT_FILE.delete();
+      FileUtil.fullyDelete(OUTPUT_DIR.getAbsoluteFile());
+    }
+    assertEquals("Streaming job failure code expected", 1, ret);
   }
 
   public static void main(String[]args) throws Exception

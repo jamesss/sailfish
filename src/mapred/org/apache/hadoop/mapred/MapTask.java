@@ -23,6 +23,7 @@ import static org.apache.hadoop.mapred.Task.Counter.COMBINE_OUTPUT_RECORDS;
 import static org.apache.hadoop.mapred.Task.Counter.MAP_INPUT_BYTES;
 import static org.apache.hadoop.mapred.Task.Counter.MAP_INPUT_RECORDS;
 import static org.apache.hadoop.mapred.Task.Counter.MAP_OUTPUT_BYTES;
+import static org.apache.hadoop.mapred.Task.Counter.MAP_OUTPUT_MATERIALIZED_BYTES;
 import static org.apache.hadoop.mapred.Task.Counter.MAP_OUTPUT_RECORDS;
 
 import java.io.DataInput;
@@ -40,8 +41,11 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.FileSystem.Statistics;
+import org.apache.hadoop.fs.LocalDirAllocator;
 import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.BytesWritable;
@@ -58,7 +62,13 @@ import org.apache.hadoop.io.serializer.Serializer;
 import org.apache.hadoop.mapred.IFile.Writer;
 import org.apache.hadoop.mapred.Merger.Segment;
 import org.apache.hadoop.mapred.SortedRanges.SkipRangeIterator;
+import org.apache.hadoop.mapred.FileInputFormat;
+import org.apache.hadoop.mapreduce.split.JobSplit;
+import org.apache.hadoop.mapreduce.split.JobSplit.SplitMetaInfo;
+import org.apache.hadoop.mapreduce.split.JobSplit.TaskSplitIndex;
+import org.apache.hadoop.mapreduce.split.JobSplit.TaskSplitMetaInfo;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.IndexedSortable;
 import org.apache.hadoop.util.IndexedSorter;
 import org.apache.hadoop.util.Progress;
@@ -72,10 +82,8 @@ class MapTask extends Task {
    * The size of each record in the index file for the map-outputs.
    */
   public static final int MAP_OUTPUT_INDEX_RECORD_LENGTH = 24;
-  
 
-  private BytesWritable split = new BytesWritable();
-  private String splitClass;
+  private TaskSplitIndex splitMetaInfo = new TaskSplitIndex();
   private final static int APPROX_HEADER_LENGTH = 150;
 
   private static final Log LOG = LogFactory.getLog(MapTask.class.getName());
@@ -89,11 +97,10 @@ class MapTask extends Task {
   }
 
   public MapTask(String jobFile, TaskAttemptID taskId, 
-                 int partition, String splitClass, BytesWritable split
-                 ) {
-    super(jobFile, taskId, partition);
-    this.splitClass = splitClass;
-    this.split = split;
+                 int partition, TaskSplitIndex splitIndex,
+                 int numSlotsRequired) {
+    super(jobFile, taskId, partition, numSlotsRequired);
+    this.splitMetaInfo = splitIndex;
   }
 
   @Override
@@ -102,32 +109,46 @@ class MapTask extends Task {
   }
 
   @Override
-  public void localizeConfiguration(JobConf conf) throws IOException {
+  public void localizeConfiguration(JobConf conf)
+      throws IOException {
     super.localizeConfiguration(conf);
-    if (isMapOrReduce()) {
-      Path localSplit = new Path(new Path(getJobFile()).getParent(), 
-                                 "split.dta");
-      LOG.debug("Writing local split to " + localSplit);
-      DataOutputStream out = FileSystem.getLocal(conf).create(localSplit);
-      Text.writeString(out, splitClass);
-      split.write(out);
+    // split.info file is used only by IsolationRunner.
+    // Write the split file to the local disk if it is a normal map task (not a
+    // job-setup or a job-cleanup task) and if the user wishes to run
+    // IsolationRunner either by setting keep.failed.tasks.files to true or by
+    // using keep.tasks.files.pattern
+    if (supportIsolationRunner(conf) && isMapOrReduce()) {
+      // localize the split meta-information
+      Path localSplitMeta =
+        new LocalDirAllocator("mapred.local.dir").getLocalPathForWrite(
+            TaskTracker.getLocalSplitFile(conf.getUser(), getJobID()
+                .toString(), getTaskID().toString()), conf);
+      LOG.debug("Writing local split to " + localSplitMeta);
+      DataOutputStream out = FileSystem.getLocal(conf).create(localSplitMeta);
+      splitMetaInfo.write(out);
       out.close();
     }
   }
   
   @Override
   public TaskRunner createRunner(TaskTracker tracker, 
-      TaskTracker.TaskInProgress tip) {
-    return new MapTaskRunner(tip, tracker, this.conf);
+                                 TaskTracker.TaskInProgress tip,
+                                 TaskTracker.RunningJob rjob
+                                 ) throws IOException {
+    return new MapTaskRunner(tip, tracker, this.conf, rjob);
   }
 
   @Override
   public void write(DataOutput out) throws IOException {
     super.write(out);
     if (isMapOrReduce()) {
-      Text.writeString(out, splitClass);
-      split.write(out);
-      split = null;
+      if (splitMetaInfo != null) {
+        splitMetaInfo.write(out);
+      } else {
+        new TaskSplitIndex().write(out);
+      }
+      //TODO do we really need to set this to null?
+      splitMetaInfo = null;
     }
   }
   
@@ -135,14 +156,13 @@ class MapTask extends Task {
   public void readFields(DataInput in) throws IOException {
     super.readFields(in);
     if (isMapOrReduce()) {
-      splitClass = Text.readString(in);
-      split.readFields(in);
+      splitMetaInfo.readFields(in);
     }
   }
 
   /**
-   * This class wraps the user's record reader to update the counters and progress
-   * as records are read.
+   * This class wraps the user's record reader to update the counters and
+   * progress as records are read.
    * @param <K>
    * @param <V>
    */
@@ -151,16 +171,36 @@ class MapTask extends Task {
     private RecordReader<K,V> rawIn;
     private Counters.Counter inputByteCounter;
     private Counters.Counter inputRecordCounter;
+    private Counters.Counter fileInputByteCounter;
+    private InputSplit split;
     private TaskReporter reporter;
     private long beforePos = -1;
     private long afterPos = -1;
-    
-    TrackedRecordReader(RecordReader<K,V> raw, TaskReporter reporter) 
-      throws IOException{
-      rawIn = raw;
+    private long bytesInPrev = -1;
+    private long bytesInCurr = -1;
+    private final Statistics fsStats;
+
+    TrackedRecordReader(InputSplit split, JobConf job, TaskReporter reporter)
+        throws IOException {
       inputRecordCounter = reporter.getCounter(MAP_INPUT_RECORDS);
       inputByteCounter = reporter.getCounter(MAP_INPUT_BYTES);
+      fileInputByteCounter = reporter
+          .getCounter(FileInputFormat.Counter.BYTES_READ);
+
+      Statistics matchedStats = null;
+      if (split instanceof FileSplit) {
+        matchedStats = getFsStatistics(((FileSplit) split).getPath(), job);
+      } 
+      fsStats = matchedStats;
+      
+      bytesInPrev = getInputBytes(fsStats);
+      rawIn = job.getInputFormat().getRecordReader(split, job, reporter);
+      bytesInCurr = getInputBytes(fsStats);
+      fileInputByteCounter.increment(bytesInCurr - bytesInPrev);
+      
       this.reporter = reporter;
+      this.split = split;
+      conf = job;
     }
 
     public K createKey() {
@@ -173,7 +213,7 @@ class MapTask extends Task {
      
     public synchronized boolean next(K key, V value)
     throws IOException {
-      boolean ret = moveToNext(key, value);
+      boolean ret = moveToNext(key, value);      
       if (ret) {
         incrCounters();
       }
@@ -183,24 +223,48 @@ class MapTask extends Task {
     protected void incrCounters() {
       inputRecordCounter.increment(1);
       inputByteCounter.increment(afterPos - beforePos);
+      fileInputByteCounter.increment(bytesInCurr - bytesInPrev);
     }
      
     protected synchronized boolean moveToNext(K key, V value)
       throws IOException {
-      reporter.setProgress(getProgress());
-      beforePos = getPos();
-      boolean ret = rawIn.next(key, value);
-      afterPos = getPos();
+      boolean ret = false;
+      try {
+        reporter.setProgress(getProgress());
+        beforePos = getPos();
+        bytesInPrev = getInputBytes(fsStats);
+        ret = rawIn.next(key, value);
+        afterPos = getPos();
+        bytesInCurr = getInputBytes(fsStats);
+      } catch (IOException ioe) {
+        if (split instanceof FileSplit) {
+          LOG.error("IO error in map input file " + conf.get("map.input.file"));
+          throw new IOException("IO error in map input file "
+              + conf.get("map.input.file"), ioe);
+        }
+        throw ioe;
+      }
       return ret;
     }
-    
+
     public long getPos() throws IOException { return rawIn.getPos(); }
-    public void close() throws IOException { rawIn.close(); }
+    
+    public void close() throws IOException {
+      bytesInPrev = getInputBytes(fsStats);
+      rawIn.close(); 
+      bytesInCurr = getInputBytes(fsStats);
+      fileInputByteCounter.increment(bytesInCurr - bytesInPrev);
+    }
+    
     public float getProgress() throws IOException {
       return rawIn.getProgress();
     }
     TaskReporter getTaskReporter() {
       return reporter;
+    }
+    
+    private long getInputBytes(Statistics stats) {
+      return stats == null ? 0 : stats.getBytesRead();
     }
   }
 
@@ -216,13 +280,13 @@ class MapTask extends Task {
     private Counters.Counter skipRecCounter;
     private long recIndex = -1;
     
-    SkippingRecordReader(RecordReader<K,V> raw, TaskUmbilicalProtocol umbilical,
-                         TaskReporter reporter) throws IOException{
-      super(raw, reporter);
+    SkippingRecordReader(InputSplit split, TaskUmbilicalProtocol umbilical,
+                         TaskReporter reporter) throws IOException {
+      super(split, conf, reporter);
       this.umbilical = umbilical;
       this.skipRecCounter = reporter.getCounter(Counter.MAP_SKIPPED_RECORDS);
       this.toWriteSkipRecs = toWriteSkipRecs() &&  
-        SkipBadRecords.getSkipOutputPath(conf)!=null;
+          SkipBadRecords.getSkipOutputPath(conf)!=null;
       skipIt = getSkipRanges().skipRangeIterator();
     }
     
@@ -277,12 +341,13 @@ class MapTask extends Task {
   }
 
   @Override
-  public void run(final JobConf job, final TaskUmbilicalProtocol umbilical)
+  public void run(final JobConf job, final TaskUmbilicalProtocol umbilical) 
     throws IOException, ClassNotFoundException, InterruptedException {
     this.umbilical = umbilical;
 
     // start thread that will handle communication with parent
-    TaskReporter reporter = new TaskReporter(getProgress(), umbilical);
+    TaskReporter reporter = new TaskReporter(getProgress(), umbilical,
+        jvmContext);
     reporter.startCommunicationThread();
     boolean useNewApi = job.getUseNewMapper();
     initialize(job, getJobID(), reporter, useNewApi);
@@ -302,44 +367,57 @@ class MapTask extends Task {
     }
 
     if (useNewApi) {
-      runNewMapper(job, split, umbilical, reporter);
+      runNewMapper(job, splitMetaInfo, umbilical, reporter);
     } else {
-      runOldMapper(job, split, umbilical, reporter);
+      runOldMapper(job, splitMetaInfo, umbilical, reporter);
     }
     done(umbilical, reporter);
   }
-
+  @SuppressWarnings("unchecked")
+  private <T> T getSplitDetails(Path file, long offset)
+   throws IOException {
+    FileSystem fs = file.getFileSystem(conf);
+    FSDataInputStream inFile = fs.open(file);
+    inFile.seek(offset);
+    String className = Text.readString(inFile);
+    Class<T> cls;
+    try {
+      cls = (Class<T>) conf.getClassByName(className);
+    } catch (ClassNotFoundException ce) {
+      IOException wrap = new IOException("Split class " + className +
+                                          " not found");
+      wrap.initCause(ce);
+      throw wrap;
+    }
+    SerializationFactory factory = new SerializationFactory(conf);
+    Deserializer<T> deserializer =
+      (Deserializer<T>) factory.getDeserializer(cls);
+    deserializer.open(inFile);
+    T split = deserializer.deserialize(null);
+    long pos = inFile.getPos();
+    getCounters().findCounter(
+         Task.Counter.SPLIT_RAW_BYTES).increment(pos - offset);
+    inFile.close();
+    return split;
+  }
+  
   @SuppressWarnings("unchecked")
   private <INKEY,INVALUE,OUTKEY,OUTVALUE>
   void runOldMapper(final JobConf job,
-                    final BytesWritable rawSplit,
+                    final TaskSplitIndex splitIndex,
                     final TaskUmbilicalProtocol umbilical,
                     TaskReporter reporter
                     ) throws IOException, InterruptedException,
                              ClassNotFoundException {
-    InputSplit inputSplit = null;
-    // reinstantiate the split
-    try {
-      inputSplit = (InputSplit) 
-        ReflectionUtils.newInstance(job.getClassByName(splitClass), job);
-    } catch (ClassNotFoundException exp) {
-      IOException wrap = new IOException("Split class " + splitClass + 
-                                         " not found");
-      wrap.initCause(exp);
-      throw wrap;
-    }
-    DataInputBuffer splitBuffer = new DataInputBuffer();
-    splitBuffer.reset(split.getBytes(), 0, split.getLength());
-    inputSplit.readFields(splitBuffer);
-    
+    InputSplit inputSplit = getSplitDetails(new Path(splitIndex.getSplitLocation()),
+           splitIndex.getStartOffset());
+
     updateJobWithSplit(job, inputSplit);
     reporter.setInputSplit(inputSplit);
 
-    RecordReader<INKEY,INVALUE> rawIn =                  // open input
-      job.getInputFormat().getRecordReader(inputSplit, job, reporter);
     RecordReader<INKEY,INVALUE> in = isSkipping() ? 
-        new SkippingRecordReader<INKEY,INVALUE>(rawIn, umbilical, reporter) :
-        new TrackedRecordReader<INKEY,INVALUE>(rawIn, reporter);
+        new SkippingRecordReader<INKEY,INVALUE>(inputSplit, umbilical, reporter) :
+        new TrackedRecordReader<INKEY,INVALUE>(inputSplit, job, reporter);
     job.setBoolean("mapred.skip.on", isSkipping());
 
 
@@ -382,18 +460,43 @@ class MapTask extends Task {
     extends org.apache.hadoop.mapreduce.RecordReader<K,V> {
     private final org.apache.hadoop.mapreduce.RecordReader<K,V> real;
     private final org.apache.hadoop.mapreduce.Counter inputRecordCounter;
+    private final org.apache.hadoop.mapreduce.Counter fileInputByteCounter;
     private final TaskReporter reporter;
+    private org.apache.hadoop.mapreduce.InputSplit inputSplit;
+    private final JobConf job;
+    private final Statistics fsStats;
     
-    NewTrackingRecordReader(org.apache.hadoop.mapreduce.RecordReader<K,V> real,
-                            TaskReporter reporter) {
-      this.real = real;
+    NewTrackingRecordReader(org.apache.hadoop.mapreduce.InputSplit split,
+        org.apache.hadoop.mapreduce.InputFormat inputFormat,
+        TaskReporter reporter, JobConf job,
+        org.apache.hadoop.mapreduce.TaskAttemptContext taskContext)
+        throws IOException, InterruptedException {
       this.reporter = reporter;
+      this.inputSplit = split;
+      this.job = job;
       this.inputRecordCounter = reporter.getCounter(MAP_INPUT_RECORDS);
+      this.fileInputByteCounter = reporter
+          .getCounter(org.apache.hadoop.mapreduce.lib.input.FileInputFormat.Counter.BYTES_READ);
+
+      Statistics matchedStats = null;
+      if (split instanceof org.apache.hadoop.mapreduce.lib.input.FileSplit) {
+        matchedStats = getFsStatistics(((org.apache.hadoop.mapreduce.lib.input.FileSplit) split)
+            .getPath(), job);
+      } 
+      fsStats = matchedStats;
+	  
+      long bytesInPrev = getInputBytes(fsStats);
+      this.real = inputFormat.createRecordReader(split, taskContext);
+      long bytesInCurr = getInputBytes(fsStats);
+      fileInputByteCounter.increment(bytesInCurr - bytesInPrev);
     }
 
     @Override
     public void close() throws IOException {
+      long bytesInPrev = getInputBytes(fsStats);
       real.close();
+      long bytesInCurr = getInputBytes(fsStats);
+      fileInputByteCounter.increment(bytesInCurr - bytesInPrev);
     }
 
     @Override
@@ -415,17 +518,40 @@ class MapTask extends Task {
     public void initialize(org.apache.hadoop.mapreduce.InputSplit split,
                            org.apache.hadoop.mapreduce.TaskAttemptContext context
                            ) throws IOException, InterruptedException {
+      long bytesInPrev = getInputBytes(fsStats);
       real.initialize(split, context);
+      long bytesInCurr = getInputBytes(fsStats);
+      fileInputByteCounter.increment(bytesInCurr - bytesInPrev);
     }
 
     @Override
     public boolean nextKeyValue() throws IOException, InterruptedException {
-      boolean result = real.nextKeyValue();
-      if (result) {
-        inputRecordCounter.increment(1);
+      boolean result = false;
+      try {
+        long bytesInPrev = getInputBytes(fsStats);
+        result = real.nextKeyValue();
+        long bytesInCurr = getInputBytes(fsStats);
+
+        if (result) {
+          inputRecordCounter.increment(1);
+          fileInputByteCounter.increment(bytesInCurr - bytesInPrev);
+        }
+        reporter.setProgress(getProgress());
+      } catch (IOException ioe) {
+        if (inputSplit instanceof FileSplit) {
+          FileSplit fileSplit = (FileSplit) inputSplit;
+          LOG.error("IO error in map input file "
+              + fileSplit.getPath().toString());
+          throw new IOException("IO error in map input file "
+              + fileSplit.getPath().toString(), ioe);
+        }
+        throw ioe;
       }
-      reporter.setProgress(getProgress());
       return result;
+    }
+    
+    private long getInputBytes(Statistics stats) {
+      return stats == null ? 0 : stats.getBytesRead();
     }
   }
 
@@ -479,15 +605,29 @@ class MapTask extends Task {
     private final TaskReporter reporter;
 
     private final Counters.Counter mapOutputRecordCounter;
+    private final Counters.Counter fileOutputByteCounter; 
+    private final Statistics fsStats;
     
     @SuppressWarnings("unchecked")
     NewDirectOutputCollector(org.apache.hadoop.mapreduce.JobContext jobContext,
         JobConf job, TaskUmbilicalProtocol umbilical, TaskReporter reporter) 
     throws IOException, ClassNotFoundException, InterruptedException {
       this.reporter = reporter;
-      out = outputFormat.getRecordWriter(taskContext);
+      Statistics matchedStats = null;
+      if (outputFormat instanceof org.apache.hadoop.mapreduce.lib.output.FileOutputFormat) {
+        matchedStats = getFsStatistics(org.apache.hadoop.mapreduce.lib.output.FileOutputFormat
+            .getOutputPath(jobContext), job);
+      }
+      fsStats = matchedStats;
       mapOutputRecordCounter = 
         reporter.getCounter(MAP_OUTPUT_RECORDS);
+      fileOutputByteCounter = reporter
+          .getCounter(org.apache.hadoop.mapreduce.lib.output.FileOutputFormat.Counter.BYTES_WRITTEN);
+
+      long bytesOutPrev = getOutputBytes(fsStats);
+      out = outputFormat.getRecordWriter(taskContext);
+      long bytesOutCurr = getOutputBytes(fsStats);
+      fileOutputByteCounter.increment(bytesOutCurr - bytesOutPrev);
     }
 
     @Override
@@ -495,7 +635,10 @@ class MapTask extends Task {
     public void write(K key, V value) 
     throws IOException, InterruptedException {
       reporter.progress();
+      long bytesOutPrev = getOutputBytes(fsStats);
       out.write(key, value);
+      long bytesOutCurr = getOutputBytes(fsStats);
+      fileOutputByteCounter.increment(bytesOutCurr - bytesOutPrev);
       mapOutputRecordCounter.increment(1);
     }
 
@@ -504,8 +647,15 @@ class MapTask extends Task {
     throws IOException,InterruptedException {
       reporter.progress();
       if (out != null) {
+        long bytesOutPrev = getOutputBytes(fsStats);
         out.close(context);
+        long bytesOutCurr = getOutputBytes(fsStats);
+        fileOutputByteCounter.increment(bytesOutCurr - bytesOutPrev);
       }
+    }
+
+    private long getOutputBytes(Statistics stats) {
+      return stats == null ? 0 : stats.getBytesWritten();
     }
   }
   
@@ -557,7 +707,7 @@ class MapTask extends Task {
   @SuppressWarnings("unchecked")
   private <INKEY,INVALUE,OUTKEY,OUTVALUE>
   void runNewMapper(final JobConf job,
-                    final BytesWritable rawSplit,
+                    final TaskSplitIndex splitIndex,
                     final TaskUmbilicalProtocol umbilical,
                     TaskReporter reporter
                     ) throws IOException, ClassNotFoundException,
@@ -575,20 +725,13 @@ class MapTask extends Task {
         ReflectionUtils.newInstance(taskContext.getInputFormatClass(), job);
     // rebuild the input split
     org.apache.hadoop.mapreduce.InputSplit split = null;
-    DataInputBuffer splitBuffer = new DataInputBuffer();
-    splitBuffer.reset(rawSplit.getBytes(), 0, rawSplit.getLength());
-    SerializationFactory factory = new SerializationFactory(job);
-    Deserializer<? extends org.apache.hadoop.mapreduce.InputSplit>
-      deserializer = 
-        (Deserializer<? extends org.apache.hadoop.mapreduce.InputSplit>) 
-        factory.getDeserializer(job.getClassByName(splitClass));
-    deserializer.open(splitBuffer);
-    split = deserializer.deserialize(null);
+    split = getSplitDetails(new Path(splitIndex.getSplitLocation()),
+        splitIndex.getStartOffset());
 
     org.apache.hadoop.mapreduce.RecordReader<INKEY,INVALUE> input =
       new NewTrackingRecordReader<INKEY,INVALUE>
-          (inputFormat.createRecordReader(split, taskContext), reporter);
-    
+          (split, inputFormat, reporter, job, taskContext);
+
     job.setBoolean("mapred.skip.on", isSkipping());
     org.apache.hadoop.mapreduce.RecordWriter output = null;
     org.apache.hadoop.mapreduce.Mapper<INKEY,INVALUE,OUTKEY,OUTVALUE>.Context 
@@ -651,6 +794,8 @@ class MapTask extends Task {
     private TaskReporter reporter = null;
 
     private final Counters.Counter mapOutputRecordCounter;
+    private final Counters.Counter fileOutputByteCounter;
+    private final Statistics fsStats;
 
     @SuppressWarnings("unchecked")
     public DirectMapOutputCollector(TaskUmbilicalProtocol umbilical,
@@ -659,14 +804,30 @@ class MapTask extends Task {
       String finalName = getOutputName(getPartition());
       FileSystem fs = FileSystem.get(job);
 
-      out = job.getOutputFormat().getRecordWriter(fs, job, finalName, reporter);
-
+      
+      OutputFormat<K, V> outputFormat = job.getOutputFormat();
+      
+      Statistics matchedStats = null;
+      if (outputFormat instanceof FileOutputFormat) {
+        matchedStats = getFsStatistics(FileOutputFormat.getOutputPath(job), job);
+      } 
+      fsStats = matchedStats;
       mapOutputRecordCounter = reporter.getCounter(MAP_OUTPUT_RECORDS);
+      fileOutputByteCounter = reporter
+          .getCounter(FileOutputFormat.Counter.BYTES_WRITTEN);
+      
+      long bytesOutPrev = getOutputBytes(fsStats);
+      out = job.getOutputFormat().getRecordWriter(fs, job, finalName, reporter);
+      long bytesOutCurr = getOutputBytes(fsStats);
+      fileOutputByteCounter.increment(bytesOutCurr - bytesOutPrev);
     }
 
     public void close() throws IOException {
       if (this.out != null) {
+        long bytesOutPrev = getOutputBytes(fsStats);
         out.close(this.reporter);
+        long bytesOutCurr = getOutputBytes(fsStats);
+        fileOutputByteCounter.increment(bytesOutCurr - bytesOutPrev);
       }
 
     }
@@ -677,10 +838,16 @@ class MapTask extends Task {
 
     public void collect(K key, V value, int partition) throws IOException {
       reporter.progress();
+      long bytesOutPrev = getOutputBytes(fsStats);
       out.write(key, value);
+      long bytesOutCurr = getOutputBytes(fsStats);
+      fileOutputByteCounter.increment(bytesOutCurr - bytesOutPrev);
       mapOutputRecordCounter.increment(1);
     }
     
+    private long getOutputBytes(Statistics stats) {
+      return stats == null ? 0 : stats.getBytesWritten();
+    }
   }
 
   class MapOutputBuffer<K extends Object, V extends Object> 
@@ -740,6 +907,7 @@ class MapTask extends Task {
     private final Counters.Counter mapOutputByteCounter;
     private final Counters.Counter mapOutputRecordCounter;
     private final Counters.Counter combineOutputCounter;
+    private final Counters.Counter fileOutputByteCounter;
     
     private ArrayList<SpillRecord> indexCacheList;
     private int totalIndexCacheMemory;
@@ -802,6 +970,7 @@ class MapTask extends Task {
       Counters.Counter combineInputCounter = 
         reporter.getCounter(COMBINE_INPUT_RECORDS);
       combineOutputCounter = reporter.getCounter(COMBINE_OUTPUT_RECORDS);
+      fileOutputByteCounter = reporter.getCounter(MAP_OUTPUT_MATERIALIZED_BYTES);
       // compression
       if (job.getCompressMapOutput()) {
         Class<? extends CompressionCodec> codecClass =
@@ -813,7 +982,7 @@ class MapTask extends Task {
                                              combineInputCounter,
                                              reporter, null);
       if (combinerRunner != null) {
-        combineCollector= new CombineOutputCollector<K,V>(combineOutputCounter);
+        combineCollector= new CombineOutputCollector<K,V>(combineOutputCounter, reporter, conf);
       } else {
         combineCollector = null;
       }
@@ -1152,6 +1321,8 @@ class MapTask extends Task {
       // release sort buffer before the merge
       kvbuffer = null;
       mergeParts();
+      Path outputPath = mapOutputFile.getOutputFile();
+      fileOutputByteCounter.increment(rfs.getFileStatus(outputPath).getLen());
     }
 
     public void close() { }
@@ -1218,8 +1389,8 @@ class MapTask extends Task {
       try {
         // create spill file
         final SpillRecord spillRec = new SpillRecord(partitions);
-        final Path filename = mapOutputFile.getSpillFileForWrite(getTaskID(),
-            numSpills, size);
+        final Path filename =
+            mapOutputFile.getSpillFileForWrite(numSpills, size);
         out = rfs.create(filename);
 
         final int endPosition = (kvend > kvstart)
@@ -1283,9 +1454,9 @@ class MapTask extends Task {
 
         if (totalIndexCacheMemory >= INDEX_CACHE_MEMORY_LIMIT) {
           // create spill index file
-          Path indexFilename = mapOutputFile.getSpillIndexFileForWrite(
-              getTaskID(), numSpills,
-              partitions * MAP_OUTPUT_INDEX_RECORD_LENGTH);
+          Path indexFilename =
+              mapOutputFile.getSpillIndexFileForWrite(numSpills, partitions
+                  * MAP_OUTPUT_INDEX_RECORD_LENGTH);
           spillRec.writeToFile(indexFilename, job);
         } else {
           indexCacheList.add(spillRec);
@@ -1311,8 +1482,8 @@ class MapTask extends Task {
       try {
         // create spill file
         final SpillRecord spillRec = new SpillRecord(partitions);
-        final Path filename = mapOutputFile.getSpillFileForWrite(getTaskID(),
-            numSpills, size);
+        final Path filename =
+            mapOutputFile.getSpillFileForWrite(numSpills, size);
         out = rfs.create(filename);
         
         // we don't run the combiner for a single record
@@ -1348,9 +1519,9 @@ class MapTask extends Task {
         }
         if (totalIndexCacheMemory >= INDEX_CACHE_MEMORY_LIMIT) {
           // create spill index file
-          Path indexFilename = mapOutputFile.getSpillIndexFileForWrite(
-              getTaskID(), numSpills,
-              partitions * MAP_OUTPUT_INDEX_RECORD_LENGTH);
+          Path indexFilename =
+              mapOutputFile.getSpillIndexFileForWrite(numSpills, partitions
+                  * MAP_OUTPUT_INDEX_RECORD_LENGTH);
           spillRec.writeToFile(indexFilename, job);
         } else {
           indexCacheList.add(spillRec);
@@ -1440,14 +1611,14 @@ class MapTask extends Task {
       final TaskAttemptID mapId = getTaskID();
 
       for(int i = 0; i < numSpills; i++) {
-        filename[i] = mapOutputFile.getSpillFile(mapId, i);
+        filename[i] = mapOutputFile.getSpillFile(i);
         finalOutFileSize += rfs.getFileStatus(filename[i]).getLen();
       }
       if (numSpills == 1) { //the spill is the final output
         rfs.rename(filename[0],
             new Path(filename[0].getParent(), "file.out"));
         if (indexCacheList.size() == 0) {
-          rfs.rename(mapOutputFile.getSpillIndexFile(mapId, 0),
+          rfs.rename(mapOutputFile.getSpillIndexFile(0),
               new Path(filename[0].getParent(),"file.out.index"));
         } else {
           indexCacheList.get(0).writeToFile(
@@ -1458,18 +1629,18 @@ class MapTask extends Task {
 
       // read in paged indices
       for (int i = indexCacheList.size(); i < numSpills; ++i) {
-        Path indexFileName = mapOutputFile.getSpillIndexFile(mapId, i);
-        indexCacheList.add(new SpillRecord(indexFileName, job));
+        Path indexFileName = mapOutputFile.getSpillIndexFile(i);
+        indexCacheList.add(new SpillRecord(indexFileName, job, null));
       }
 
       //make correction in the length to include the sequence file header
       //lengths for each partition
       finalOutFileSize += partitions * APPROX_HEADER_LENGTH;
       finalIndexFileSize = partitions * MAP_OUTPUT_INDEX_RECORD_LENGTH;
-      Path finalOutputFile = mapOutputFile.getOutputFileForWrite(mapId,
-                             finalOutFileSize);
-      Path finalIndexFile = mapOutputFile.getOutputIndexFileForWrite(
-                            mapId, finalIndexFileSize);
+      Path finalOutputFile =
+          mapOutputFile.getOutputFileForWrite(finalOutFileSize);
+      Path finalIndexFile =
+          mapOutputFile.getOutputIndexFileForWrite(finalIndexFileSize);
 
       //The output stream for the final single output file
       FSDataOutputStream finalOut = rfs.create(finalOutputFile, true, 4096);

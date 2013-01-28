@@ -23,6 +23,7 @@ import java.io.*;
 import java.util.*;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.mapred.lib.KeyFieldBasedPartitioner;
 
@@ -78,11 +79,11 @@ public class TestStreamDataProtocol extends TestCase
     };
   }
   
-  public void testCommandLine() throws Exception
+  public void testCommandLine()
   {
     try {
       try {
-        OUTPUT_DIR.getAbsoluteFile().delete();
+        FileUtil.fullyDelete(OUTPUT_DIR.getAbsoluteFile());
       } catch (Exception e) {
       }
 
@@ -100,12 +101,23 @@ public class TestStreamDataProtocol extends TestCase
       System.err.println("  out1=" + output);
       System.err.println("  equals=" + outputExpect.compareTo(output));
       assertEquals(outputExpect, output);
+    } catch(Exception e) {
+      failTrace(e);
     } finally {
-      File outFileCRC = new File(OUTPUT_DIR, ".part-00000.crc").getAbsoluteFile();
-      INPUT_FILE.delete();
-      outFileCRC.delete();
-      OUTPUT_DIR.getAbsoluteFile().delete();
+      try {
+        INPUT_FILE.delete();
+        FileUtil.fullyDelete(OUTPUT_DIR.getAbsoluteFile());
+      } catch(Exception e) {
+        failTrace(e);
+      }
     }
+  }
+
+  private void failTrace(Exception e)
+  {
+    StringWriter sw = new StringWriter();
+    e.printStackTrace(new PrintWriter(sw));
+    fail(sw.toString());
   }
 
   public static void main(String[]args) throws Exception

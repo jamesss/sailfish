@@ -22,6 +22,8 @@ import java.net.UnknownHostException;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
 
 /**
  * Utility class to simplify creation and reporting of hadoop metrics.
@@ -30,7 +32,11 @@ import org.apache.commons.logging.LogFactory;
  * @see org.apache.hadoop.metrics.MetricsRecord
  * @see org.apache.hadoop.metrics.MetricsContext
  * @see org.apache.hadoop.metrics.ContextFactory
+ * @deprecated in favor of <code>org.apache.hadoop.metrics2</code> usage.
  */
+@Deprecated
+@InterfaceAudience.LimitedPrivate({"HDFS", "MapReduce"})
+@InterfaceStability.Evolving
 public class MetricsUtil {
     
   public static final Log LOG =

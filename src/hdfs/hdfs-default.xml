@@ -28,7 +28,7 @@ creations/deletions), or "all".</description>
   <name>dfs.datanode.address</name>
   <value>0.0.0.0:50010</value>
   <description>
-    The address where the datanode server will listen to.
+    The datanode server address and port for data transfer.
     If the port is 0 then the server will start on a free port.
   </description>
 </property>
@@ -190,6 +190,30 @@ creations/deletions), or "all".</description>
 </property>
 
 <property>
+  <name>dfs.block.access.token.enable</name>
+  <value>false</value>
+  <description>
+    If "true", access tokens are used as capabilities for accessing datanodes.
+    If "false", no access tokens are checked on accessing datanodes.
+  </description>
+</property>
+
+<property>
+  <name>dfs.block.access.key.update.interval</name>
+  <value>600</value>
+  <description>
+    Interval in minutes at which namenode updates its access keys.
+  </description>
+</property>
+
+<property>
+  <name>dfs.block.access.token.lifetime</name>
+  <value>600</value>
+  <description>The lifetime of access tokens in minutes.</description>
+</property>
+
+
+<property>
   <name>dfs.data.dir</name>
   <value>${hadoop.tmp.dir}/dfs/data</value>
   <description>Determines where on the local filesystem an DFS data node
@@ -198,6 +222,14 @@ creations/deletions), or "all".</description>
   directories, typically on different devices.
   Directories that do not exist are ignored.
   </description>
+</property>
+
+<property>
+  <name>dfs.datanode.data.dir.perm</name>
+  <value>755</value>
+  <description>Permissions for the directories on on the local filesystem where 
+  the DFS data node store its blocks. The permissions can either be octal or 
+  symbolic.</description>
 </property>
 
 <property>
@@ -272,8 +304,23 @@ creations/deletions), or "all".</description>
   <description>
     Specifies the percentage of blocks that should satisfy 
     the minimal replication requirement defined by dfs.replication.min.
-    Values less than or equal to 0 mean not to start in safe mode.
+    Values less than or equal to 0 mean not to wait for any particular
+    percentage of blocks before exiting safemode.
     Values greater than 1 will make safe mode permanent.
+  </description>
+ </property>
+ 
+<property>
+  <name>dfs.namenode.safemode.min.datanodes</name>
+  <value>0</value>
+  <description>
+    Specifies the number of datanodes that must be considered alive
+    before the name node exits safemode.
+    Values less than or equal to 0 mean not to take the number of live
+    datanodes into account when deciding whether to remain in safe mode
+    during startup.
+    Values greater than the number of datanodes in the cluster
+    will make safe mode permanent.
   </description>
 </property>
 
@@ -355,10 +402,145 @@ creations/deletions), or "all".</description>
 
 <property>
   <name>dfs.support.append</name>
+  <description>
+    This option is no longer supported. HBase no longer requires that
+    this option be enabled as sync is now enabled by default. See
+    HADOOP-8230 for additional information.
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.delegation.key.update-interval</name>
+  <value>86400000</value>
+  <description>The update interval for master key for delegation tokens 
+       in the namenode in milliseconds.
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.delegation.token.max-lifetime</name>
+  <value>604800000</value>
+  <description>The maximum lifetime in milliseconds for which a delegation 
+      token is valid.
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.delegation.token.renew-interval</name>
+  <value>86400000</value>
+  <description>The renewal interval for delegation token in milliseconds.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.failed.volumes.tolerated</name>
+  <value>0</value>
+  <description>The number of volumes that are allowed to
+  fail before a datanode stops offering service. By default
+  any volume failure will cause a datanode to shutdown.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.max.xcievers</name>
+  <value>4096</value>
+  <description>Specifies the maximum number of threads to use for transferring data
+  in and out of the DN.
+  </description>
+</property>
+
+<property>
+  <name>dfs.client.use.datanode.hostname</name>
   <value>false</value>
-  <description>Does HDFS allow appends to files?
-               This is currently set to false because there are bugs in the
-               "append code" and is not supported in any prodction cluster.
+  <description>Whether clients should use datanode hostnames when
+    connecting to datanodes.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.use.datanode.hostname</name>
+  <value>false</value>
+  <description>Whether datanodes should use datanode hostnames when
+    connecting to other datanodes for data transfer.
+  </description>
+</property>
+
+<property>
+  <name>dfs.client.local.interfaces</name>
+  <value></value>
+  <description>A comma separated list of network interface names to use
+    for data transfer between the client and datanodes. When creating
+    a connection to read from or write to a datanode, the client
+    chooses one of the specified interfaces at random and binds its
+    socket to the IP of that interface. Individual names may be
+    specified as either an interface name (eg "eth0"), a subinterface
+    name (eg "eth0:0"), or an IP address (which may be specified using
+    CIDR notation to match a range of IPs).
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.kerberos.internal.spnego.principal</name>
+  <value>${dfs.web.authentication.kerberos.principal}</value>
+</property>
+
+<property>
+  <name>dfs.secondary.namenode.kerberos.internal.spnego.principal</name>
+  <value>${dfs.web.authentication.kerberos.principal}</value>
+</property>
+
+<property>
+  <name>dfs.namenode.invalidate.work.pct.per.iteration</name>
+  <value>0.32f</value>
+  <description>
+    *Note*: Advanced property. Change with caution.
+    This determines the percentage amount of block
+    invalidations (deletes) to do over a single DN heartbeat
+    deletion command. The final deletion count is determined by applying this
+    percentage to the number of live nodes in the system.
+    The resultant number is the number of blocks from the deletion list
+    chosen for proper invalidation over a single heartbeat of a single DN.
+    Value should be a positive, non-zero percentage in float notation (X.Yf),
+    with 1.0f meaning 100%.
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.replication.work.multiplier.per.iteration</name>
+  <value>2</value>
+  <description>
+    *Note*: Advanced property. Change with caution.
+    This determines the total amount of block transfers to begin in
+    parallel at a DN, for replication, when such a command list is being
+    sent over a DN heartbeat by the NN. The actual number is obtained by
+    multiplying this multiplier with the total number of live nodes in the
+    cluster. The result number is the number of blocks to begin transfers
+    immediately for, per DN heartbeat. This number can be any positive,
+    non-zero integer.
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.check.stale.datanode</name>
+  <value>false</value>
+  <description>
+  	Indicate whether or not to check "stale" datanodes whose 
+  	heartbeat messages have not been received by the namenode 
+  	for more than a specified time interval. If this configuration 
+  	parameter is set as true, the stale datanodes will be moved to 
+  	the end of the target node list for reading. The writing will 
+  	also try to avoid stale nodes.
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.stale.datanode.interval</name>
+  <value>30000</value>
+  <description>
+  	Default time interval for marking a datanode as "stale", i.e., if 
+  	the namenode has not received heartbeat msg from a datanode for 
+  	more than this time interval, the datanode will be marked and treated 
+  	as "stale" by default.
   </description>
 </property>
 

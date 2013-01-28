@@ -19,18 +19,22 @@ package org.apache.hadoop.hdfs;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 
 import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.BlockLocation;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
@@ -43,13 +47,16 @@ import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
 import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.log4j.Level;
+import org.junit.Test;
 
+import static org.junit.Assume.assumeTrue;
+import static org.junit.Assert.*;
 
 /**
  * This class tests that a file need not be closed before its
  * data can be read by another client.
  */
-public class TestFileCreation extends junit.framework.TestCase {
+public class TestFileCreation {
   static final String DIR = "/" + TestFileCreation.class.getSimpleName() + "/";
 
   {
@@ -93,7 +100,7 @@ public class TestFileCreation extends junit.framework.TestCase {
     byte[] buffer = AppendTestUtil.randomBytes(seed, size);
     stm.write(buffer, 0, size);
   }
-
+  
   //
   // verify that the data written to the full blocks are sane
   // 
@@ -167,11 +174,54 @@ public class TestFileCreation extends junit.framework.TestCase {
     stm.close();
   }
 
+  @Test
+  public void testFileCreation() throws IOException {
+    checkFileCreation(null, null);
+  }
+
+  /** Same test but the client should use DN hostname instead of IPs */
+  @Test
+  public void testFileCreationByHostname() throws IOException {
+    assumeTrue(System.getProperty("os.name").startsWith("Linux"));
+
+    // Since the mini cluster only listens on the loopback we have to
+    // ensure the hostname used to access DNs maps to the loopback. We
+    // do this by telling the DN to advertise localhost as its hostname
+    // instead of the default hostname.
+    checkFileCreation("localhost", null);
+  }
+
+  /** Same test but the client should bind to a local interface */
+  @Test
+  public void testFileCreationSetLocalInterface() throws IOException {
+    assumeTrue(System.getProperty("os.name").startsWith("Linux"));
+
+    // The mini cluster listens on the loopback so we can use it here
+    checkFileCreation(null, "lo");
+
+    try {
+      checkFileCreation(null, "bogus-interface");
+      fail("Able to specify a bogus interface");
+    } catch (UnknownHostException e) {
+      assertEquals("Unknown interface bogus-interface", e.getMessage());
+    }
+  }
+
   /**
    * Test that file data becomes available before file is closed.
+   * @param hostname the hostname, if any, clients should use to access DNs
+   * @param netIf the local interface, if any, clients should use to access DNs
    */
-  public void testFileCreation() throws IOException {
+  public void checkFileCreation(String hostname, String netIf) throws IOException {
     Configuration conf = new Configuration();
+
+    if (hostname != null) {
+      conf.setBoolean(DFSConfigKeys.DFS_CLIENT_USE_DN_HOSTNAME, true);
+      conf.set("slave.host.name", hostname);
+    }
+    if (netIf != null) {
+      conf.set(DFSConfigKeys.DFS_CLIENT_LOCAL_INTERFACES, netIf);
+    }
     if (simulatedStorage) {
       conf.setBoolean(SimulatedFSDataset.CONFIG_PROPERTY_SIMULATED, true);
     }
@@ -250,6 +300,7 @@ public class TestFileCreation extends junit.framework.TestCase {
   /**
    * Test deleteOnExit
    */
+  @Test
   public void testDeleteOnExit() throws IOException {
     Configuration conf = new Configuration();
     if (simulatedStorage) {
@@ -310,8 +361,102 @@ public class TestFileCreation extends junit.framework.TestCase {
   }
 
   /**
+   * Test file creation using createNonRecursive().
+   */
+  @Test
+  public void testFileCreationNonRecursive() throws IOException {
+    Configuration conf = new Configuration();
+    if (simulatedStorage) {
+      conf.setBoolean(SimulatedFSDataset.CONFIG_PROPERTY_SIMULATED, true);
+    }
+    MiniDFSCluster cluster = new MiniDFSCluster(conf, 1, true, null);
+    FileSystem fs = cluster.getFileSystem();
+    final Path path = new Path("/" + System.currentTimeMillis()
+        + "-testFileCreationNonRecursive");
+    FSDataOutputStream out = null;
+
+    try {
+      IOException expectedException = null;
+      final String nonExistDir = "/non-exist-" + System.currentTimeMillis();
+
+      fs.delete(new Path(nonExistDir), true);
+      // Create a new file in root dir, should succeed
+      out = createNonRecursive(fs, path, 1, false);
+      out.close();
+      // Create a file when parent dir exists as file, should fail
+      expectedException = null;
+      try {
+        createNonRecursive(fs, new Path(path, "Create"), 1, false);
+      } catch (IOException e) {
+        expectedException = e;
+      }
+      assertTrue("Create a file when parent directory exists as a file"
+          + " should throw FileAlreadyExistsException ",
+          expectedException != null
+              && expectedException instanceof FileAlreadyExistsException);
+      fs.delete(path, true);
+      // Create a file in a non-exist directory, should fail
+      final Path path2 = new Path(nonExistDir + "/testCreateNonRecursive");
+      expectedException = null;
+      try {
+        createNonRecursive(fs, path2, 1, false);
+      } catch (IOException e) {
+        expectedException = e;
+      }
+      assertTrue("Create a file in a non-exist dir using"
+          + " createNonRecursive() should throw FileNotFoundException ",
+          expectedException != null
+              && expectedException instanceof FileNotFoundException);
+
+      // Overwrite a file in root dir, should succeed
+      out = createNonRecursive(fs, path, 1, true);
+      out.close();
+      // Overwrite a file when parent dir exists as file, should fail
+      expectedException = null;
+      try {
+        createNonRecursive(fs, new Path(path, "Overwrite"), 1, true);
+      } catch (IOException e) {
+        expectedException = e;
+      }
+      assertTrue("Overwrite a file when parent directory exists as a file"
+          + " should throw FileAlreadyExistsException ",
+          expectedException != null
+              && expectedException instanceof FileAlreadyExistsException);
+      fs.delete(path, true);
+      // Overwrite a file in a non-exist directory, should fail
+      final Path path3 = new Path(nonExistDir + "/testOverwriteNonRecursive");
+      expectedException = null;
+      try {
+        createNonRecursive(fs, path3, 1, true);
+      } catch (IOException e) {
+        expectedException = e;
+      }
+      assertTrue("Overwrite a file in a non-exist dir using"
+          + " createNonRecursive() should throw FileNotFoundException ",
+          expectedException != null
+              && expectedException instanceof FileNotFoundException);
+    } finally {
+      fs.close();
+      cluster.shutdown();
+    }
+  }
+
+  // creates a file using DistributedFileSystem.createNonRecursive()
+  static FSDataOutputStream createNonRecursive(FileSystem fs, Path name,
+      int repl, boolean overwrite) throws IOException {
+    System.out.println("createNonRecursive: Created " + name + " with " + repl
+        + " replica.");
+    FSDataOutputStream stm = ((DistributedFileSystem) fs).createNonRecursive(
+        name, FsPermission.getDefault(), overwrite, fs.getConf().getInt(
+            "io.file.buffer.size", 4096), (short) repl, (long) blockSize, null);
+
+    return stm;
+  }
+  
+  /**
    * Test that file data does not become corrupted even in the face of errors.
    */
+  @Test
   public void testFileCreationError1() throws IOException {
     Configuration conf = new Configuration();
     conf.setInt("heartbeat.recheck.interval", 1000);
@@ -384,6 +529,7 @@ public class TestFileCreation extends junit.framework.TestCase {
    * Test that the filesystem removes the last block from a file if its
    * lease expires.
    */
+  @Test
   public void testFileCreationError2() throws IOException {
     long leasePeriod = 1000;
     System.out.println("testFileCreationError2 start");
@@ -453,6 +599,7 @@ public class TestFileCreation extends junit.framework.TestCase {
    * This test is currently not triggered because more HDFS work is 
    * is needed to handle persistent leases.
    */
+  //@Test
   public void xxxtestFileCreationNamenodeRestart() throws IOException {
     Configuration conf = new Configuration();
     final int MAX_IDLE_TIME = 2000; // 2s
@@ -478,7 +625,16 @@ public class TestFileCreation extends junit.framework.TestCase {
                          + "Created file " + file1);
 
       // write two full blocks.
-      writeFile(stm, numBlocks * blockSize);
+      int remainingPiece = blockSize/2;
+      int blocksMinusPiece = numBlocks * blockSize - remainingPiece;
+      writeFile(stm, blocksMinusPiece);
+      stm.sync();
+      int actualRepl = ((DFSClient.DFSOutputStream)(stm.getWrappedStream())).
+                        getNumCurrentReplicas();
+      // if we sync on a block boundary, actualRepl will be 0
+      assertTrue(file1 + " should be replicated to 1 datanodes, not " + actualRepl,
+                 actualRepl == 1);
+      writeFile(stm, remainingPiece);
       stm.sync();
 
       // rename file wile keeping it open.
@@ -585,7 +741,8 @@ public class TestFileCreation extends junit.framework.TestCase {
   /**
    * Test that all open files are closed when client dies abnormally.
    */
-  public void testDFSClientDeath() throws IOException {
+  @Test
+  public void testDFSClientDeath() throws IOException, InterruptedException {
     Configuration conf = new Configuration();
     System.out.println("Testing adbornal client death.");
     if (simulatedStorage) {
@@ -621,6 +778,7 @@ public class TestFileCreation extends junit.framework.TestCase {
 /**
  * Test that file data becomes available before file is closed.
  */
+  @Test
   public void testFileCreationSimulated() throws IOException {
     simulatedStorage = true;
     testFileCreation();
@@ -630,6 +788,7 @@ public class TestFileCreation extends junit.framework.TestCase {
   /**
    * Test creating two files at the same time. 
    */
+  @Test
   public void testConcurrentFileCreation() throws IOException {
     Configuration conf = new Configuration();
     MiniDFSCluster cluster = new MiniDFSCluster(conf, 1, true, null);
@@ -660,10 +819,44 @@ public class TestFileCreation extends junit.framework.TestCase {
   }
 
   /**
+   * Test creating a file whose data gets sync when closed
+   */
+  public void testFileCreationSyncOnClose() throws IOException {
+    Configuration conf = new Configuration();
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_SYNCONCLOSE_KEY, true);
+    MiniDFSCluster cluster = new MiniDFSCluster(conf, 1, true, null);
+
+    try {
+      FileSystem fs = cluster.getFileSystem();
+      
+      Path[] p = {new Path("/foo"), new Path("/bar")};
+      
+      //write 2 files at the same time
+      FSDataOutputStream[] out = {fs.create(p[0]), fs.create(p[1])};
+      int i = 0;
+      for(; i < 100; i++) {
+        out[0].write(i);
+        out[1].write(i);
+      }
+      out[0].close();
+      for(; i < 200; i++) {out[1].write(i);}
+      out[1].close();
+
+      //verify
+      FSDataInputStream[] in = {fs.open(p[0]), fs.open(p[1])};  
+      for(i = 0; i < 100; i++) {assertEquals(i, in[0].read());}
+      for(i = 0; i < 200; i++) {assertEquals(i, in[1].read());}
+    } finally {
+      if (cluster != null) {cluster.shutdown();}
+    }
+  }
+  
+  /**
    * Create a file, write something, fsync but not close.
    * Then change lease period and wait for lease recovery.
    * Finally, read the block directly from each Datanode and verify the content.
    */
+  @Test
   public void testLeaseExpireHardLimit() throws Exception {
     System.out.println("testLeaseExpireHardLimit start");
     final long leasePeriod = 1000;
@@ -686,6 +879,10 @@ public class TestFileCreation extends junit.framework.TestCase {
       FSDataOutputStream out = TestFileCreation.createFile(dfs, fpath, DATANODE_NUM);
       out.write("something".getBytes());
       out.sync();
+      int actualRepl = ((DFSClient.DFSOutputStream)(out.getWrappedStream())).
+                        getNumCurrentReplicas();
+      assertTrue(f + " should be replicated to " + DATANODE_NUM + " datanodes.",
+                 actualRepl == DATANODE_NUM);
 
       // set the soft and hard limit to be 1 second so that the
       // namenode triggers lease recovery
@@ -722,6 +919,7 @@ public class TestFileCreation extends junit.framework.TestCase {
   }
 
   // test closing file system before all file handles are closed.
+  @Test
   public void testFsClose() throws Exception {
     System.out.println("test file system close start");
     final int DATANODE_NUM = 3;
@@ -745,6 +943,53 @@ public class TestFileCreation extends junit.framework.TestCase {
       dfs.close();
     } finally {
       System.out.println("testFsClose successful");
+      cluster.shutdown();
+    }
+  }
+
+  // test closing file after cluster is shutdown
+  public void testFsCloseAfterClusterShutdown() throws IOException {
+    System.out.println("test testFsCloseAfterClusterShutdown start");
+    final int DATANODE_NUM = 3;
+
+    Configuration conf = new Configuration();
+    conf.setInt("dfs.replication.min", 3);
+    conf.setBoolean("ipc.client.ping", false); // hdfs timeout is default 60 seconds
+    conf.setInt("ipc.ping.interval", 10000); // hdfs timeout is now 10 second
+
+    // create cluster
+    MiniDFSCluster cluster = new MiniDFSCluster(conf, DATANODE_NUM, true, null);
+    DistributedFileSystem dfs = null;
+    try {
+      cluster.waitActive();
+      dfs = (DistributedFileSystem)cluster.getFileSystem();
+
+      // create a new file.
+      final String f = DIR + "dhrubashutdown";
+      final Path fpath = new Path(f);
+      FSDataOutputStream out = TestFileCreation.createFile(dfs, fpath, DATANODE_NUM);
+      out.write("something_dhruba".getBytes());
+      out.sync();    // ensure that block is allocated
+
+      // shutdown last datanode in pipeline.
+      cluster.stopDataNode(2);
+
+      // close file. Since we have set the minReplcatio to 3 but have killed one
+      // of the three datanodes, the close call will loop until the hdfsTimeout is
+      // encountered.
+      boolean hasException = false;
+      try {
+        out.close();
+        System.out.println("testFsCloseAfterClusterShutdown: Error here");
+      } catch (IOException e) {
+        hasException = true;
+      }
+      assertTrue("Failed to close file after cluster shutdown", hasException);
+    } finally {
+      System.out.println("testFsCloseAfterClusterShutdown successful");
+      if (cluster != null) {
+        cluster.shutdown();
+      }
     }
   }
 }

@@ -18,22 +18,40 @@
 
 package org.apache.hadoop.hdfs;
 
-import java.io.*;
-import java.net.*;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.util.ArrayList;
 
-import org.apache.hadoop.fs.permission.FsPermission;
-import org.apache.hadoop.fs.*;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
-import org.apache.hadoop.hdfs.protocol.FSConstants;
+import org.apache.hadoop.fs.BlockLocation;
+import org.apache.hadoop.fs.ContentSummary;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.MD5MD5CRC32FileChecksum;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.protocol.Block;
-import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.protocol.DirectoryListing;
+import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.FSConstants.DatanodeReportType;
+import org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction;
 import org.apache.hadoop.hdfs.protocol.FSConstants.UpgradeAction;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
 import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
-import org.apache.hadoop.hdfs.DFSClient.DFSOutputStream;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.ipc.Client;
 import org.apache.hadoop.security.AccessControlException;
+import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.util.Progressable;
 
 
@@ -80,42 +98,9 @@ public class DistributedFileSystem extends FileSystem {
 
     InetSocketAddress namenode = NameNode.getAddress(uri.getAuthority());
     this.dfs = new DFSClient(namenode, conf, statistics);
-    this.uri = NameNode.getUri(namenode);
+    this.uri = URI.create(uri.getScheme()+"://"+uri.getAuthority());
     this.workingDir = getHomeDirectory();
   }
-
-  /** Permit paths which explicitly specify the default port. */
-  protected void checkPath(Path path) {
-    URI thisUri = this.getUri();
-    URI thatUri = path.toUri();
-    String thatAuthority = thatUri.getAuthority();
-    if (thatUri.getScheme() != null
-        && thatUri.getScheme().equalsIgnoreCase(thisUri.getScheme())
-        && thatUri.getPort() == NameNode.DEFAULT_PORT
-        && thisUri.getPort() == -1
-        && thatAuthority.substring(0,thatAuthority.indexOf(":"))
-        .equalsIgnoreCase(thisUri.getAuthority()))
-      return;
-    super.checkPath(path);
-  }
-
-  /** Normalize paths that explicitly specify the default port. */
-  public Path makeQualified(Path path) {
-    URI thisUri = this.getUri();
-    URI thatUri = path.toUri();
-    String thatAuthority = thatUri.getAuthority();
-    if (thatUri.getScheme() != null
-        && thatUri.getScheme().equalsIgnoreCase(thisUri.getScheme())
-        && thatUri.getPort() == NameNode.DEFAULT_PORT
-        && thisUri.getPort() == -1
-        && thatAuthority.substring(0,thatAuthority.indexOf(":"))
-        .equalsIgnoreCase(thisUri.getAuthority())) {
-      path = new Path(thisUri.getScheme(), thisUri.getAuthority(),
-                      thatUri.getPath());
-    }
-    return super.makeQualified(path);
-  }
-
 
   public Path getWorkingDirectory() {
     return workingDir;
@@ -148,7 +133,7 @@ public class DistributedFileSystem extends FileSystem {
 
   /** {@inheritDoc} */
   public Path getHomeDirectory() {
-    return new Path("/user/" + dfs.ugi.getUserName()).makeQualified(this);
+    return new Path("/user/" + dfs.ugi.getShortUserName()).makeQualified(this);
   }
 
   private String getPathName(Path file) {
@@ -167,6 +152,7 @@ public class DistributedFileSystem extends FileSystem {
     if (file == null) {
       return null;
     }
+    statistics.incrementReadOps(1);
     return dfs.getBlockLocations(getPathName(file.getPath()), start, len);
   }
 
@@ -175,16 +161,27 @@ public class DistributedFileSystem extends FileSystem {
   }
 
   public FSDataInputStream open(Path f, int bufferSize) throws IOException {
+    statistics.incrementReadOps(1);
     return new DFSClient.DFSDataInputStream(
           dfs.open(getPathName(f), bufferSize, verifyChecksum, statistics));
+  }
+
+  /** 
+   * Start the lease recovery of a file
+   *
+   * @param f a file
+   * @return true if the file is already closed
+   * @throws IOException if an error occurs
+   */
+  public boolean recoverLease(Path f) throws IOException {
+    return dfs.recoverLease(getPathName(f));
   }
 
   /** This optional operation is not yet supported. */
   public FSDataOutputStream append(Path f, int bufferSize,
       Progressable progress) throws IOException {
-
-    DFSOutputStream op = (DFSOutputStream)dfs.append(getPathName(f), bufferSize, progress);
-    return new FSDataOutputStream(op, statistics, op.getInitialLen());
+    statistics.incrementWriteOps(1);
+    return dfs.append(getPathName(f), bufferSize, progress, statistics);
   }
 
   public FSDataOutputStream create(Path f, FsPermission permission,
@@ -192,15 +189,33 @@ public class DistributedFileSystem extends FileSystem {
     int bufferSize, short replication, long blockSize,
     Progressable progress) throws IOException {
 
+    statistics.incrementWriteOps(1);
     return new FSDataOutputStream
        (dfs.create(getPathName(f), permission,
-                   overwrite, replication, blockSize, progress, bufferSize),
+                   overwrite, true, replication, blockSize, progress, bufferSize),
         statistics);
+  }
+
+  /**
+   * Same as create(), except fails if parent directory doesn't already exist.
+   * @see #create(Path, FsPermission, boolean, int, short, long, Progressable)
+   */
+  @Override
+  public FSDataOutputStream createNonRecursive(Path f, FsPermission permission,
+      boolean overwrite,
+      int bufferSize, short replication, long blockSize, 
+      Progressable progress) throws IOException {
+    statistics.incrementWriteOps(1);
+    return new FSDataOutputStream
+        (dfs.create(getPathName(f), permission, 
+                    overwrite, false, replication, blockSize, progress, bufferSize), 
+         statistics);
   }
 
   public boolean setReplication(Path src, 
                                 short replication
                                ) throws IOException {
+    statistics.incrementWriteOps(1);
     return dfs.setReplication(getPathName(src), replication);
   }
 
@@ -208,6 +223,7 @@ public class DistributedFileSystem extends FileSystem {
    * Rename files/dirs
    */
   public boolean rename(Path src, Path dst) throws IOException {
+    statistics.incrementWriteOps(1);
     return dfs.rename(getPathName(src), getPathName(dst));
   }
 
@@ -216,6 +232,7 @@ public class DistributedFileSystem extends FileSystem {
    */
   @Deprecated
   public boolean delete(Path f) throws IOException {
+    statistics.incrementWriteOps(1);
     return dfs.delete(getPathName(f));
   }
   
@@ -224,11 +241,13 @@ public class DistributedFileSystem extends FileSystem {
    * empty directory recursively.
    */
   public boolean delete(Path f, boolean recursive) throws IOException {
-   return dfs.delete(getPathName(f), recursive);
+    statistics.incrementWriteOps(1);
+    return dfs.delete(getPathName(f), recursive);
   }
   
   /** {@inheritDoc} */
   public ContentSummary getContentSummary(Path f) throws IOException {
+    statistics.incrementReadOps(1);
     return dfs.getContentSummary(getPathName(f));
   }
 
@@ -240,25 +259,76 @@ public class DistributedFileSystem extends FileSystem {
     dfs.setQuota(getPathName(src), namespaceQuota, diskspaceQuota);
   }
   
-  private FileStatus makeQualified(FileStatus f) {
+  private FileStatus makeQualified(HdfsFileStatus f, Path parent) {
     return new FileStatus(f.getLen(), f.isDir(), f.getReplication(),
         f.getBlockSize(), f.getModificationTime(),
         f.getAccessTime(),
         f.getPermission(), f.getOwner(), f.getGroup(),
-        f.getPath().makeQualified(this)); // fully-qualify path
+        f.getFullPath(parent).makeQualified(this)); // fully-qualify path
   }
 
+  /**
+   * List all the entries of a directory
+   * 
+   * Note that this operation is not atomic for a large directory.
+   * The entries of a directory may be fetched from NameNode multiple times.
+   * It only guarantees that  each name occurs once if a directory 
+   * undergoes changes between the calls.
+   */
+  @Override
   public FileStatus[] listStatus(Path p) throws IOException {
-    FileStatus[] infos = dfs.listPaths(getPathName(p));
-    if (infos == null) return null;
-    FileStatus[] stats = new FileStatus[infos.length];
-    for (int i = 0; i < infos.length; i++) {
-      stats[i] = makeQualified(infos[i]);
+    String src = getPathName(p);
+    
+    // fetch the first batch of entries in the directory
+    DirectoryListing thisListing = dfs.listPaths(
+        src, HdfsFileStatus.EMPTY_NAME);
+    
+    if (thisListing == null) { // the directory does not exist
+      return null;
     }
-    return stats;
+    
+    HdfsFileStatus[] partialListing = thisListing.getPartialListing();
+    if (!thisListing.hasMore()) { // got all entries of the directory
+      FileStatus[] stats = new FileStatus[partialListing.length];
+      for (int i = 0; i < partialListing.length; i++) {
+        stats[i] = makeQualified(partialListing[i], p);
+      }
+      statistics.incrementReadOps(1);
+      return stats;
+    }
+    
+    // The directory size is too big that it needs to fetch more
+    // estimate the total number of entries in the directory
+    int totalNumEntries = 
+      partialListing.length + thisListing.getRemainingEntries();
+    ArrayList<FileStatus> listing = 
+      new ArrayList<FileStatus>(totalNumEntries);
+    // add the first batch of entries to the array list
+    for (HdfsFileStatus fileStatus : partialListing) {
+      listing.add(makeQualified(fileStatus, p));
+    }
+    statistics.incrementLargeReadOps(1);
+
+    // now fetch more entries
+    do {
+      thisListing = dfs.listPaths(src, thisListing.getLastName());
+      
+      if (thisListing == null) {
+        return null; // the directory is deleted
+      }
+      
+      partialListing = thisListing.getPartialListing();
+      for (HdfsFileStatus fileStatus : partialListing) {
+        listing.add(makeQualified(fileStatus, p));
+      }
+      statistics.incrementLargeReadOps(1);
+    } while (thisListing.hasMore());
+
+    return listing.toArray(new FileStatus[listing.size()]);
   }
 
   public boolean mkdirs(Path f, FsPermission permission) throws IOException {
+    statistics.incrementWriteOps(1);
     return dfs.mkdirs(getPathName(f), permission);
   }
 
@@ -450,9 +520,10 @@ public class DistributedFileSystem extends FileSystem {
    * @throws FileNotFoundException if the file does not exist.
    */
   public FileStatus getFileStatus(Path f) throws IOException {
-    FileStatus fi = dfs.getFileInfo(getPathName(f));
+    statistics.incrementReadOps(1);
+    HdfsFileStatus fi = dfs.getFileInfo(getPathName(f));
     if (fi != null) {
-      return makeQualified(fi);
+      return makeQualified(fi, f);
     } else {
       throw new FileNotFoundException("File does not exist: " + f);
     }
@@ -460,12 +531,14 @@ public class DistributedFileSystem extends FileSystem {
 
   /** {@inheritDoc} */
   public MD5MD5CRC32FileChecksum getFileChecksum(Path f) throws IOException {
+    statistics.incrementReadOps(1);
     return dfs.getFileChecksum(getPathName(f));
   }
 
   /** {@inheritDoc }*/
   public void setPermission(Path p, FsPermission permission
       ) throws IOException {
+    statistics.incrementWriteOps(1);
     dfs.setPermission(getPathName(p), permission);
   }
 
@@ -475,14 +548,135 @@ public class DistributedFileSystem extends FileSystem {
     if (username == null && groupname == null) {
       throw new IOException("username == null && groupname == null");
     }
+    statistics.incrementWriteOps(1);
     dfs.setOwner(getPathName(p), username, groupname);
   }
 
   /** {@inheritDoc }*/
   public void setTimes(Path p, long mtime, long atime
       ) throws IOException {
+    statistics.incrementWriteOps(1);
     dfs.setTimes(getPathName(p), mtime, atime);
   }
+
+  @Override
+  protected int getDefaultPort() {
+    return NameNode.DEFAULT_PORT;
+  }
+
+  @Override
+  public 
+  Token<DelegationTokenIdentifier> getDelegationToken(String renewer
+                                                      ) throws IOException {
+    Token<DelegationTokenIdentifier> result =
+      dfs.getDelegationToken(renewer == null ? null : new Text(renewer));
+    return result;
+  }
+
+  /** 
+   * Delegation Token Operations
+   * These are DFS only operations.
+   */
   
-  
+  /**
+   * Get a valid Delegation Token.
+   * 
+   * @param renewer Name of the designated renewer for the token
+   * @return Token<DelegationTokenIdentifier>
+   * @throws IOException
+   * @Deprecated use {@link #getDelegationToken(String)}
+   */
+  @Deprecated
+  public Token<DelegationTokenIdentifier> getDelegationToken(Text renewer)
+      throws IOException {
+    return getDelegationToken(renewer.toString());
+  }
+
+  /**
+   * Renew an existing delegation token.
+   * 
+   * @param token delegation token obtained earlier
+   * @return the new expiration time
+   * @throws IOException
+   * @deprecated Use Token.renew instead.
+   */
+  public long renewDelegationToken(Token<DelegationTokenIdentifier> token)
+      throws InvalidToken, IOException {
+    try {
+      return token.renew(getConf());
+    } catch (InterruptedException ie) {
+      throw new RuntimeException("Caught interrupted", ie);
+    }
+  }
+
+  /**
+   * Cancel an existing delegation token.
+   * 
+   * @param token delegation token
+   * @throws IOException
+   * @deprecated Use Token.cancel instead.
+   */
+  public void cancelDelegationToken(Token<DelegationTokenIdentifier> token)
+      throws IOException {
+    try {
+      token.cancel(getConf());
+    } catch (InterruptedException ie) {
+      throw new RuntimeException("Caught interrupted", ie);
+    }
+  }
+
+  /**
+   * Requests the namenode to tell all datanodes to use a new, non-persistent
+   * bandwidth value for dfs.balance.bandwidthPerSec.
+   * The bandwidth parameter is the max number of bytes per second of network
+   * bandwidth to be used by a datanode during balancing.
+   *
+   * @param bandwidth Blanacer bandwidth in bytes per second for all datanodes.
+   * @throws IOException
+   */
+  public void setBalancerBandwidth(long bandwidth) throws IOException {
+    dfs.setBalancerBandwidth(bandwidth);
+  }
+
+  /**
+   * Is the HDFS healthy?
+   * HDFS is considered as healthy if it is up and not in safemode.
+   *
+   * @param uri the HDFS URI.  Note that the URI path is ignored.
+   * @return true if HDFS is healthy; false, otherwise.
+   */
+  public static boolean isHealthy(URI uri) {
+    //check scheme
+    final String scheme = uri.getScheme();
+    if (!"hdfs".equalsIgnoreCase(scheme)) {
+      throw new IllegalArgumentException("This scheme is not hdfs, uri=" + uri);
+    }
+    
+    final Configuration conf = new Configuration();
+    //disable FileSystem cache
+    conf.setBoolean(String.format("fs.%s.impl.disable.cache", scheme), true);
+    //disable client retry for rpc connection and rpc calls
+    conf.setBoolean(DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_ENABLED_KEY, false);
+    conf.setInt(Client.IPC_CLIENT_CONNECT_MAX_RETRIES_KEY, 0);
+
+    DistributedFileSystem fs = null;
+    try {
+      fs = (DistributedFileSystem)FileSystem.get(uri, conf);
+      final boolean safemode = fs.setSafeMode(SafeModeAction.SAFEMODE_GET);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Is namenode in safemode? " + safemode + "; uri=" + uri);
+      }
+
+      fs.close();
+      fs = null;
+      return !safemode;
+    } catch(IOException e) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Got an exception for uri=" + uri, e);
+      }
+      return false;
+    } finally {
+      IOUtils.cleanup(LOG, fs);
+    }
+  }
 }

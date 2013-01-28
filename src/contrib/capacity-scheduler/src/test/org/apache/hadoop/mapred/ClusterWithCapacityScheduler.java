@@ -26,15 +26,13 @@ import java.net.URL;
 import java.util.Enumeration;
 import java.util.Properties;
 
-import junit.framework.TestCase;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.junit.After;
 
 /**
  * A test-cluster based on {@link MiniMRCluster} that is started with
@@ -43,7 +41,7 @@ import org.apache.hadoop.hdfs.MiniDFSCluster;
  * should extend this.
  * 
  */
-public class ClusterWithCapacityScheduler extends TestCase {
+public class ClusterWithCapacityScheduler {
 
   static final Log LOG = LogFactory.getLog(ClusterWithCapacityScheduler.class);
   private MiniMRCluster mrCluster;
@@ -146,15 +144,15 @@ public class ClusterWithCapacityScheduler extends TestCase {
   }
 
   protected JobConf getJobConf() {
-    return this.jobConf;
+    return new JobConf(this.jobConf);
   }
 
   protected JobTracker getJobTracker() {
     return this.mrCluster.getJobTrackerRunner().getJobTracker();
   }
 
-  @Override
-  protected void tearDown()
+  @After
+  public void tearDown()
       throws Exception {
     cleanUpSchedulerConfigFile();
     
@@ -195,6 +193,13 @@ public class ClusterWithCapacityScheduler extends TestCase {
       LOG.info("Waiting till cluster reaches steady state. currentTasks : "
           + currentTasks + " total cluster capacity : " + maxTasks);
     }
+  }
+
+  /**
+   * @return the mrCluster
+   */
+  public MiniMRCluster getMrCluster() {
+    return mrCluster;
   }
 
   static class MyClassLoader extends ClassLoader {

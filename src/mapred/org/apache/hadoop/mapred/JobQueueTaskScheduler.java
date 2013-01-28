@@ -25,6 +25,7 @@ import java.util.List;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.mapreduce.server.jobtracker.TaskTracker;
 
 /**
  * A {@link TaskScheduler} that keeps jobs in a queue in priority order (FIFO
@@ -77,9 +78,15 @@ class JobQueueTaskScheduler extends TaskScheduler {
   }
 
   @Override
-  public synchronized List<Task> assignTasks(TaskTrackerStatus taskTracker)
+  public synchronized List<Task> assignTasks(TaskTracker taskTracker)
       throws IOException {
+    // Check for JT safe-mode
+    if (taskTrackerManager.isInSafeMode()) {
+      LOG.info("JobTracker is in safe-mode, not scheduling any tasks.");
+      return null;
+    } 
 
+    TaskTrackerStatus taskTrackerStatus = taskTracker.getStatus(); 
     ClusterStatus clusterStatus = taskTrackerManager.getClusterStatus();
     final int numTaskTrackers = clusterStatus.getTaskTrackers();
     final int clusterMapCapacity = clusterStatus.getMaxMapTasks();
@@ -91,10 +98,10 @@ class JobQueueTaskScheduler extends TaskScheduler {
     //
     // Get map + reduce counts for the current tracker.
     //
-    final int trackerMapCapacity = taskTracker.getMaxMapTasks();
-    final int trackerReduceCapacity = taskTracker.getMaxReduceTasks();
-    final int trackerRunningMaps = taskTracker.countMapTasks();
-    final int trackerRunningReduces = taskTracker.countReduceTasks();
+    final int trackerMapCapacity = taskTrackerStatus.getMaxMapSlots();
+    final int trackerReduceCapacity = taskTrackerStatus.getMaxReduceSlots();
+    final int trackerRunningMaps = taskTrackerStatus.countMapTasks();
+    final int trackerRunningReduces = taskTrackerStatus.countReduceTasks();
 
     // Assigned tasks
     List<Task> assignedTasks = new ArrayList<Task>();
@@ -167,8 +174,8 @@ class JobQueueTaskScheduler extends TaskScheduler {
           
           // Try to schedule a node-local or rack-local Map task
           t = 
-            job.obtainNewLocalMapTask(taskTracker, numTaskTrackers,
-                                      taskTrackerManager.getNumberOfUniqueHosts());
+            job.obtainNewNodeOrRackLocalMapTask(taskTrackerStatus, 
+                numTaskTrackers, taskTrackerManager.getNumberOfUniqueHosts());
           if (t != null) {
             assignedTasks.add(t);
             ++numLocalMaps;
@@ -186,7 +193,7 @@ class JobQueueTaskScheduler extends TaskScheduler {
           
           // Try to schedule a node-local or rack-local Map task
           t = 
-            job.obtainNewNonLocalMapTask(taskTracker, numTaskTrackers,
+            job.obtainNewNonLocalMapTask(taskTrackerStatus, numTaskTrackers,
                                    taskTrackerManager.getNumberOfUniqueHosts());
           
           if (t != null) {
@@ -224,7 +231,7 @@ class JobQueueTaskScheduler extends TaskScheduler {
           }
 
           Task t = 
-            job.obtainNewReduceTask(taskTracker, numTaskTrackers, 
+            job.obtainNewReduceTask(taskTrackerStatus, numTaskTrackers, 
                                     taskTrackerManager.getNumberOfUniqueHosts()
                                     );
           if (t != null) {
@@ -243,7 +250,7 @@ class JobQueueTaskScheduler extends TaskScheduler {
     }
     
     if (LOG.isDebugEnabled()) {
-      LOG.debug("Task assignments for " + taskTracker.getTrackerName() + " --> " +
+      LOG.debug("Task assignments for " + taskTrackerStatus.getTrackerName() + " --> " +
                 "[" + mapLoadFactor + ", " + trackerMapCapacity + ", " + 
                 trackerCurrentMapCapacity + ", " + trackerRunningMaps + "] -> [" + 
                 (trackerCurrentMapCapacity - trackerRunningMaps) + ", " +

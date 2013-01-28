@@ -32,6 +32,8 @@ import java.util.Map;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.metrics.ContextFactory;
 import org.apache.hadoop.metrics.MetricsException;
 import org.apache.hadoop.metrics.spi.AbstractMetricsContext;
@@ -41,7 +43,11 @@ import org.apache.hadoop.metrics.spi.Util;
 /**
  * Context for sending metrics to Ganglia.
  * 
+ * @deprecated in favor of <code>org.apache.hadoop.metrics2</code> usage.
  */
+@Deprecated
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
 public class GangliaContext extends AbstractMetricsContext {
     
   private static final String PERIOD_PROPERTY = "period";
@@ -71,36 +77,26 @@ public class GangliaContext extends AbstractMetricsContext {
     typeTable.put(Float.class, "float");
   }
     
-  private byte[] buffer = new byte[BUFFER_SIZE];
-  private int offset;
+  protected byte[] buffer = new byte[BUFFER_SIZE];
+  protected int offset;
     
-  private List<? extends SocketAddress> metricsServers;
+  protected List<? extends SocketAddress> metricsServers;
   private Map<String,String> unitsTable;
   private Map<String,String> slopeTable;
   private Map<String,String> tmaxTable;
   private Map<String,String> dmaxTable;
     
-  private DatagramSocket datagramSocket;
+  protected DatagramSocket datagramSocket;
     
   /** Creates a new instance of GangliaContext */
+  @InterfaceAudience.Private
   public GangliaContext() {
   }
     
+  @InterfaceAudience.Private
   public void init(String contextName, ContextFactory factory) {
     super.init(contextName, factory);
-        
-    String periodStr = getAttribute(PERIOD_PROPERTY);
-    if (periodStr != null) {
-      int period = 0;
-      try {
-        period = Integer.parseInt(periodStr);
-      } catch (NumberFormatException nfe) {
-      }
-      if (period <= 0) {
-        throw new MetricsException("Invalid period: " + periodStr);
-      }
-      setPeriod(period);
-    }
+    parseAndSetPeriod(PERIOD_PROPERTY);
         
     metricsServers = 
       Util.parse(getAttribute(SERVERS_PROPERTY), DEFAULT_PORT); 
@@ -118,6 +114,7 @@ public class GangliaContext extends AbstractMetricsContext {
     }
   }
 
+  @InterfaceAudience.Private
   public void emitRecord(String contextName, String recordName,
     OutputRecord outRec) 
   throws IOException {
@@ -144,7 +141,7 @@ public class GangliaContext extends AbstractMetricsContext {
     }
   }
     
-  private void emitMetric(String name, String type,  String value) 
+  protected void emitMetric(String name, String type,  String value) 
   throws IOException {
     String units = getUnits(name);
     int slope = getSlope(name);
@@ -168,7 +165,7 @@ public class GangliaContext extends AbstractMetricsContext {
     }
   }
     
-  private String getUnits(String metricName) {
+  protected String getUnits(String metricName) {
     String result = unitsTable.get(metricName);
     if (result == null) {
       result = DEFAULT_UNITS;
@@ -176,7 +173,7 @@ public class GangliaContext extends AbstractMetricsContext {
     return result;
   }
     
-  private int getSlope(String metricName) {
+  protected int getSlope(String metricName) {
     String slopeString = slopeTable.get(metricName);
     if (slopeString == null) {
       slopeString = DEFAULT_SLOPE; 
@@ -184,7 +181,7 @@ public class GangliaContext extends AbstractMetricsContext {
     return ("zero".equals(slopeString) ? 0 : 3); // see gmetric.c
   }
     
-  private int getTmax(String metricName) {
+  protected int getTmax(String metricName) {
     if (tmaxTable == null) {
       return DEFAULT_TMAX;
     }
@@ -197,7 +194,7 @@ public class GangliaContext extends AbstractMetricsContext {
     }
   }
     
-  private int getDmax(String metricName) {
+  protected int getDmax(String metricName) {
     String dmaxString = dmaxTable.get(metricName);
     if (dmaxString == null) {
       return DEFAULT_DMAX;
@@ -212,7 +209,7 @@ public class GangliaContext extends AbstractMetricsContext {
    * as an int, followed by the bytes of the string, padded if necessary to
    * a multiple of 4.
    */
-  private void xdr_string(String s) {
+  protected void xdr_string(String s) {
     byte[] bytes = s.getBytes();
     int len = bytes.length;
     xdr_int(len);
@@ -234,7 +231,7 @@ public class GangliaContext extends AbstractMetricsContext {
   /**
    * Puts an integer into the buffer as 4 bytes, big-endian.
    */
-  private void xdr_int(int i) {
+  protected void xdr_int(int i) {
     buffer[offset++] = (byte)((i >> 24) & 0xff);
     buffer[offset++] = (byte)((i >> 16) & 0xff);
     buffer[offset++] = (byte)((i >> 8) & 0xff);

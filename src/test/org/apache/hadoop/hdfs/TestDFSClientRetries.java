@@ -17,40 +17,124 @@
  */
 package org.apache.hadoop.hdfs;
 
+import static org.mockito.Matchers.anyLong;
+import static org.mockito.Matchers.anyString;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
+
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+
+import junit.framework.Assert;
+import junit.framework.TestCase;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.*;
+import org.apache.hadoop.fs.ContentSummary;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileChecksum;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSClient.DFSInputStream;
-import org.apache.hadoop.hdfs.protocol.*;
+import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol;
+import org.apache.hadoop.hdfs.protocol.ClientProtocol;
+import org.apache.hadoop.hdfs.protocol.DatanodeID;
+import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.protocol.DirectoryListing;
+import org.apache.hadoop.hdfs.protocol.FSConstants;
+import org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction;
 import org.apache.hadoop.hdfs.protocol.FSConstants.UpgradeAction;
-import org.apache.hadoop.hdfs.server.common.*;
-import org.apache.hadoop.hdfs.server.namenode.NotReplicatedYetException;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
-import org.apache.hadoop.io.*;
+import org.apache.hadoop.hdfs.server.namenode.NotReplicatedYetException;
+import org.apache.hadoop.hdfs.web.WebHdfsTestUtil;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.retry.RetryPolicies.MultipleLinearRandomRetry;
+import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ipc.RemoteException;
+import org.apache.hadoop.ipc.Server;
+import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.AccessControlException;
-
-import junit.framework.TestCase;
-import static org.mockito.Mockito.*;
-import org.mockito.stubbing.Answer;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.StringUtils;
+import org.apache.log4j.Level;
 import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 
 /**
  * These tests make sure that DFSClient retries fetching data from DFS
  * properly in case of errors.
  */
 public class TestDFSClientRetries extends TestCase {
+  private static final String ADDRESS = "0.0.0.0";
+  final static private int PING_INTERVAL = 1000;
+  final static private int MIN_SLEEP_TIME = 1000;
   public static final Log LOG =
     LogFactory.getLog(TestDFSClientRetries.class.getName());
-  
+  final static private Configuration conf = new Configuration();
+ 
+ private static class TestServer extends Server {
+    private boolean sleep;
+    private Class<? extends Writable> responseClass;
+
+    public TestServer(int handlerCount, boolean sleep) throws IOException {
+      this(handlerCount, sleep, LongWritable.class, null);
+    }
+
+    public TestServer(int handlerCount, boolean sleep,
+        Class<? extends Writable> paramClass,
+        Class<? extends Writable> responseClass)
+      throws IOException {
+      super(ADDRESS, 0, paramClass, handlerCount, conf);
+      this.sleep = sleep;
+      this.responseClass = responseClass;
+    }
+
+    @Override
+    public Writable call(Class<?> protocol, Writable param, long receiveTime)
+        throws IOException {
+      if (sleep) {
+        // sleep a bit
+        try {
+          Thread.sleep(PING_INTERVAL + MIN_SLEEP_TIME);
+        } catch (InterruptedException e) {}
+      }
+      if (responseClass != null) {
+        try {
+          return responseClass.newInstance();
+        } catch (Exception e) {
+          throw new RuntimeException(e);
+        }
+      } else {
+        return param;                               // echo param as result
+      }
+    }
+  }
+ 
   // writes 'len' bytes of data to out.
   private static void writeData(OutputStream out, int len) throws IOException {
     byte [] buf = new byte[4096*16];
@@ -67,7 +151,6 @@ public class TestDFSClientRetries extends TestCase {
    */
   public void testWriteTimeoutAtDataNode() throws IOException,
                                                   InterruptedException { 
-    Configuration conf = new Configuration();
     
     final int writeTimeout = 100; //milliseconds.
     // set a very short write timeout for datanode, so that tests runs fast.
@@ -145,6 +228,13 @@ public class TestDFSClientRetries extends TestCase {
     public LocatedBlock addBlock(String src, String clientName)
     throws IOException
     {
+      return addBlock(src, clientName, null);
+    }
+
+
+    public LocatedBlock addBlock(String src, String clientName,
+                                 DatanodeInfo[] excludedNode)
+      throws IOException {
       num_calls++;
       if (num_calls > num_calls_allowed) { 
         throw new IOException("addBlock called more times than "
@@ -158,10 +248,12 @@ public class TestDFSClientRetries extends TestCase {
     
     
     // The following methods are stub methods that are not needed by this mock class
-
     public LocatedBlocks  getBlockLocations(String src, long offset, long length) throws IOException { return null; }
 
+    @Deprecated
     public void create(String src, FsPermission masked, String clientName, boolean overwrite, short replication, long blockSize) throws IOException {}
+
+    public void create(String src, FsPermission masked, String clientName, boolean overwrite, boolean createparent, short replication, long blockSize) throws IOException {}
 
     public LocatedBlock append(String src, String clientName) throws IOException { return null; }
 
@@ -185,7 +277,9 @@ public class TestDFSClientRetries extends TestCase {
 
     public boolean mkdirs(String src, FsPermission masked) throws IOException { return false; }
 
-    public FileStatus[] getListing(String src) throws IOException { return null; }
+    public HdfsFileStatus[] getListing(String src) throws IOException { return null; }
+
+    public DirectoryListing getListing(String src, byte[] startName) throws IOException { return null; }
 
     public void renewLease(String clientName) throws IOException {}
 
@@ -209,7 +303,9 @@ public class TestDFSClientRetries extends TestCase {
 
     public void metaSave(String filename) throws IOException {}
 
-    public FileStatus getFileInfo(String src) throws IOException { return null; }
+    public void setBalancerBandwidth(long bandwidth) throws IOException {}
+
+    public HdfsFileStatus getFileInfo(String src) throws IOException { return null; }
 
     public ContentSummary getContentSummary(String path) throws IOException { return null; }
 
@@ -219,12 +315,25 @@ public class TestDFSClientRetries extends TestCase {
 
     public void setTimes(String src, long mtime, long atime) throws IOException {}
 
+    public boolean recoverLease(String src, String clientName) throws IOException {return true;}
+
+    public Token<DelegationTokenIdentifier> getDelegationToken(Text renewer)
+        throws IOException {
+      return null;
+    }
+
+    public long renewDelegationToken(Token<DelegationTokenIdentifier> token)
+        throws InvalidToken, IOException {
+      return 0;
+    }
+
+    public void cancelDelegationToken(Token<DelegationTokenIdentifier> token)
+        throws IOException {
+    }
   }
   
   public void testNotYetReplicatedErrors() throws IOException
   {   
-    Configuration conf = new Configuration();
-    
     // allow 1 retry (2 total calls)
     conf.setInt("dfs.client.block.write.locateFollowingBlock.retries", 1);
         
@@ -251,7 +360,6 @@ public class TestDFSClientRetries extends TestCase {
     long fileSize = 4096;
     Path file = new Path("/testFile");
 
-    Configuration conf = new Configuration();
     MiniDFSCluster cluster = new MiniDFSCluster(conf, 1, true, null);
 
     int maxBlockAcquires = DFSClient.getMaxBlockAcquireFailures(conf);
@@ -358,6 +466,319 @@ public class TestDFSClientRetries extends TestCase {
       List<LocatedBlock> badBlocks = new ArrayList<LocatedBlock>();
       badBlocks.add(badLocatedBlock);
       return new LocatedBlocks(goodBlockList.getFileLength(), badBlocks, false);
+    }
+  }
+  
+  /** Test that timeout occurs when DN does not respond to RPC.
+   * Start up a server and ask it to sleep for n seconds. Make an
+   * RPC to the server and set rpcTimeout to less than n and ensure
+   * that socketTimeoutException is obtained
+   */
+  public void testClientDNProtocolTimeout() throws IOException {
+    final Server server = new TestServer(1, true);
+    server.start();
+
+    final InetSocketAddress addr = NetUtils.getConnectAddress(server);
+    DatanodeID fakeDnId = new DatanodeID(
+        "localhost:" + addr.getPort(), "fake-storage", 0, addr.getPort());
+    DatanodeInfo dnInfo = new DatanodeInfo(fakeDnId);
+
+    LocatedBlock fakeBlock = new LocatedBlock(new Block(12345L), new DatanodeInfo[0]);
+
+    ClientDatanodeProtocol proxy = null;
+
+    try {
+      proxy = DFSClient.createClientDatanodeProtocolProxy(dnInfo, conf,
+          fakeBlock.getBlock(), fakeBlock.getBlockToken(), 500, false);
+
+      fail ("Did not get expected exception: SocketTimeoutException");
+    } catch (SocketTimeoutException e) {
+      LOG.info("Got the expected Exception: SocketTimeoutException");
+    } finally {
+      if (proxy != null) {
+        RPC.stopProxy(proxy);
+      }
+      server.stop();
+    }
+  }
+
+  public void testGetFileChecksum() throws Exception {
+    final String f = "/testGetFileChecksum";
+    final Path p = new Path(f);
+
+    final Configuration conf = new Configuration();
+    final MiniDFSCluster cluster = new MiniDFSCluster(conf, 3, true, null);
+    try {
+      cluster.waitActive();
+
+      //create a file
+      final FileSystem fs = cluster.getFileSystem();
+      DFSTestUtil.createFile(fs, p, 1L << 20, (short)3, 20100402L);
+
+      //get checksum
+      final FileChecksum cs1 = fs.getFileChecksum(p);
+      assertTrue(cs1 != null);
+
+      //stop the first datanode
+      final List<LocatedBlock> locatedblocks = DFSClient.callGetBlockLocations(
+          cluster.getNameNode(), f, 0, Long.MAX_VALUE).getLocatedBlocks();
+      final DatanodeInfo first = locatedblocks.get(0).getLocations()[0];
+      cluster.stopDataNode(first.getName());
+
+      //get checksum again
+      final FileChecksum cs2 = fs.getFileChecksum(p);
+      assertEquals(cs1, cs2);
+    } finally {
+      cluster.shutdown();
+    }
+  }
+
+  /** Test client retry with namenode restarting. */
+  public void testNamenodeRestart() throws Exception {
+    namenodeRestartTest(new Configuration(), false);
+  }
+
+  public static void namenodeRestartTest(final Configuration conf,
+      final boolean isWebHDFS) throws Exception {
+    ((Log4JLogger)DFSClient.LOG).getLogger().setLevel(Level.ALL);
+
+    final List<Exception> exceptions = new ArrayList<Exception>();
+
+    final Path dir = new Path("/testNamenodeRestart");
+
+    conf.setBoolean(DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_ENABLED_KEY, true);
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_SAFEMODE_MIN_DATANODES_KEY, 1);
+    conf.setInt("dfs.safemode.extension.testing", 5000);
+
+    final short numDatanodes = 3;
+    final MiniDFSCluster cluster = new MiniDFSCluster(
+        conf, numDatanodes, true, null);
+    try {
+      cluster.waitActive();
+      final DistributedFileSystem dfs = (DistributedFileSystem)cluster.getFileSystem();
+      final FileSystem fs = isWebHDFS?
+          WebHdfsTestUtil.getWebHdfsFileSystem(conf): dfs;
+      final URI uri = dfs.getUri();
+      assertTrue(DistributedFileSystem.isHealthy(uri));
+
+      //create a file
+      final long length = 1L << 20;
+      final Path file1 = new Path(dir, "foo"); 
+      DFSTestUtil.createFile(fs, file1, length, numDatanodes, 20120406L);
+
+      //get file status
+      final FileStatus s1 = fs.getFileStatus(file1);
+      assertEquals(length, s1.getLen());
+
+      //create file4, write some data but not close
+      final Path file4 = new Path(dir, "file4"); 
+      final FSDataOutputStream out4 = fs.create(file4, false, 4096,
+          fs.getDefaultReplication(file4), 1024L, null);
+      final byte[] bytes = new byte[1000];
+      new Random().nextBytes(bytes);
+      out4.write(bytes);
+      out4.write(bytes);
+      out4.sync();
+
+      //shutdown namenode
+      assertTrue(DistributedFileSystem.isHealthy(uri));
+      cluster.shutdownNameNode();
+      assertFalse(DistributedFileSystem.isHealthy(uri));
+
+      //namenode is down, continue writing file4 in a thread
+      final Thread file4thread = new Thread(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            //write some more data and then close the file
+            out4.write(bytes);
+            out4.write(bytes);
+            out4.write(bytes);
+            out4.close();
+          } catch (Exception e) {
+            exceptions.add(e);
+          }
+        }
+      });
+      file4thread.start();
+
+      //namenode is down, read the file in a thread
+      final Thread reader = new Thread(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            //it should retry till namenode is up.
+            final FileSystem fs = createFsWithDifferentUsername(conf, isWebHDFS);
+            final FSDataInputStream in = fs.open(file1);
+            int count = 0;
+            for(; in.read() != -1; count++);
+            in.close();
+            assertEquals(s1.getLen(), count);
+          } catch (Exception e) {
+            exceptions.add(e);
+          }
+        }
+      });
+      reader.start();
+
+      //namenode is down, create another file in a thread
+      final Path file3 = new Path(dir, "file"); 
+      final Thread thread = new Thread(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            //it should retry till namenode is up.
+            final FileSystem fs = createFsWithDifferentUsername(conf, isWebHDFS);
+            DFSTestUtil.createFile(fs, file3, length, numDatanodes, 20120406L);
+          } catch (Exception e) {
+            exceptions.add(e);
+          }
+        }
+      });
+      thread.start();
+ 
+      //restart namenode in a new thread
+      new Thread(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            //sleep, restart, and then wait active
+            TimeUnit.SECONDS.sleep(30);
+            assertFalse(DistributedFileSystem.isHealthy(uri));
+            cluster.restartNameNode(false, false);
+            cluster.waitActive();
+            assertTrue(DistributedFileSystem.isHealthy(uri));
+          } catch (Exception e) {
+            exceptions.add(e);
+          }
+        }
+      }).start();
+
+      //namenode is down, it should retry until namenode is up again. 
+      final FileStatus s2 = fs.getFileStatus(file1);
+      assertEquals(s1, s2);
+
+      //check file1 and file3
+      thread.join();
+      assertEmpty(exceptions);
+      assertEquals(s1.getLen(), fs.getFileStatus(file3).getLen());
+      assertEquals(fs.getFileChecksum(file1), fs.getFileChecksum(file3));
+
+      reader.join();
+      assertEmpty(exceptions);
+
+      //check file4
+      file4thread.join();
+      assertEmpty(exceptions);
+      {
+        final FSDataInputStream in = fs.open(file4);
+        int count = 0;
+        for(int r; (r = in.read()) != -1; count++) {
+          Assert.assertEquals(String.format("count=%d", count),
+              bytes[count % bytes.length], (byte)r);
+        }
+        Assert.assertEquals(5 * bytes.length, count);
+        in.close();
+      }
+
+      //enter safe mode
+      assertTrue(DistributedFileSystem.isHealthy(uri));
+      dfs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+      assertFalse(DistributedFileSystem.isHealthy(uri));
+      
+      //leave safe mode in a new thread
+      new Thread(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            //sleep and then leave safe mode
+            TimeUnit.SECONDS.sleep(30);
+            assertFalse(DistributedFileSystem.isHealthy(uri));
+            dfs.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
+            assertTrue(DistributedFileSystem.isHealthy(uri));
+          } catch (Exception e) {
+            exceptions.add(e);
+          }
+        }
+      }).start();
+
+      //namenode is in safe mode, create should retry until it leaves safe mode.
+      final Path file2 = new Path(dir, "bar");
+      DFSTestUtil.createFile(fs, file2, length, numDatanodes, 20120406L);
+      assertEquals(fs.getFileChecksum(file1), fs.getFileChecksum(file2));
+
+      assertTrue(DistributedFileSystem.isHealthy(uri));
+      
+      //make sure it won't retry on exceptions like FileNotFoundException
+      final Path nonExisting = new Path(dir, "nonExisting");
+      LOG.info("setPermission: " + nonExisting);
+      try {
+        fs.setPermission(nonExisting, new FsPermission((short)0));
+        fail();
+      } catch(FileNotFoundException fnfe) {
+        LOG.info("GOOD!", fnfe);
+      }
+
+      assertEmpty(exceptions);
+    } finally {
+      cluster.shutdown();
+    }
+  }
+
+  static void assertEmpty(final List<Exception> exceptions) {
+    if (!exceptions.isEmpty()) {
+      final StringBuilder b = new StringBuilder("There are ")
+        .append(exceptions.size())
+        .append(" exception(s):");
+      for(int i = 0; i < exceptions.size(); i++) {
+        b.append("\n  Exception ")
+         .append(i)
+         .append(": ")
+         .append(StringUtils.stringifyException(exceptions.get(i)));
+      }
+      fail(b.toString());
+    }
+  }
+
+  private static FileSystem createFsWithDifferentUsername(
+      final Configuration conf, final boolean isWebHDFS
+      ) throws IOException, InterruptedException {
+    String username = UserGroupInformation.getCurrentUser().getShortUserName()+"_XXX";
+    UserGroupInformation ugi = 
+      UserGroupInformation.createUserForTesting(username, new String[]{"supergroup"});
+    
+    return isWebHDFS? WebHdfsTestUtil.getWebHdfsFileSystemAs(ugi, conf)
+        : DFSTestUtil.getFileSystemAs(ugi, conf);
+  }
+
+  public void testMultipleLinearRandomRetry() {
+    parseMultipleLinearRandomRetry(null, "");
+    parseMultipleLinearRandomRetry(null, "11");
+    parseMultipleLinearRandomRetry(null, "11,22,33");
+    parseMultipleLinearRandomRetry(null, "11,22,33,44,55");
+    parseMultipleLinearRandomRetry(null, "AA");
+    parseMultipleLinearRandomRetry(null, "11,AA");
+    parseMultipleLinearRandomRetry(null, "11,22,33,FF");
+    parseMultipleLinearRandomRetry(null, "11,-22");
+    parseMultipleLinearRandomRetry(null, "-11,22");
+
+    parseMultipleLinearRandomRetry("[22x11ms]",
+        "11,22");
+    parseMultipleLinearRandomRetry("[22x11ms, 44x33ms]",
+        "11,22,33,44");
+    parseMultipleLinearRandomRetry("[22x11ms, 44x33ms, 66x55ms]",
+        "11,22,33,44,55,66");
+    parseMultipleLinearRandomRetry("[22x11ms, 44x33ms, 66x55ms]",
+        "   11,   22, 33,  44, 55,  66   ");
+  }
+  
+  static void parseMultipleLinearRandomRetry(String expected, String s) {
+    final MultipleLinearRandomRetry r = MultipleLinearRandomRetry.parseCommaSeparatedString(s);
+    LOG.info("input=" + s + ", parsed=" + r + ", expected=" + expected);
+    if (r == null) {
+      Assert.assertEquals(expected, null);
+    } else {
+      Assert.assertEquals("MultipleLinearRandomRetry" + expected, r.toString());
     }
   }
 }

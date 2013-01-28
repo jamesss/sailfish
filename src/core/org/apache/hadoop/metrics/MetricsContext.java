@@ -21,10 +21,20 @@
 package org.apache.hadoop.metrics;
 
 import java.io.IOException;
+import java.util.Collection;
+import java.util.Map;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.metrics.spi.OutputRecord;
 
 /**
  * The main interface to the metrics package. 
+ * @deprecated in favor of <code>org.apache.hadoop.metrics2</code> usage.
  */
+@Deprecated
+@InterfaceAudience.Private
+@InterfaceStability.Evolving
 public interface MetricsContext {
     
   /**
@@ -103,5 +113,12 @@ public interface MetricsContext {
    * Returns the timer period.
    */
   public abstract int getPeriod();
-    
+  
+  /**
+   * Retrieves all the records managed by this MetricsContext.
+   * Useful for monitoring systems that are polling-based.
+   * 
+   * @return A non-null map from all record names to the records managed.
+   */
+   Map<String, Collection<OutputRecord>> getAllRecords();
 }

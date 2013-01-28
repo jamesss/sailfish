@@ -20,13 +20,13 @@ package org.apache.hadoop.fs;
 
 import java.io.*;
 import java.util.Arrays;
-import java.util.zip.CRC32;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.util.Progressable;
+import org.apache.hadoop.util.PureJavaCrc32;
 import org.apache.hadoop.util.StringUtils;
 
 /****************************************************************
@@ -135,7 +135,7 @@ public abstract class ChecksumFileSystem extends FilterFileSystem {
         if (!Arrays.equals(version, CHECKSUM_VERSION))
           throw new IOException("Not a checksum file: "+sumFile);
         this.bytesPerSum = sums.readInt();
-        set(fs.verifyChecksum, new CRC32(), bytesPerSum, 4);
+        set(fs.verifyChecksum, new PureJavaCrc32(), bytesPerSum, 4);
       } catch (FileNotFoundException e) {         // quietly ignore
         set(fs.verifyChecksum, null, 1, 0);
       } catch (IOException e) {                   // loudly ignore
@@ -330,7 +330,7 @@ public abstract class ChecksumFileSystem extends FilterFileSystem {
                           long blockSize,
                           Progressable progress)
       throws IOException {
-      super(new CRC32(), fs.getBytesPerSum(), 4);
+      super(new PureJavaCrc32(), fs.getBytesPerSum(), 4);
       int bytesPerSum = fs.getBytesPerSum();
       this.datas = fs.getRawFileSystem().create(file, overwrite, bufferSize, 
                                          replication, blockSize, progress);
@@ -361,9 +361,22 @@ public abstract class ChecksumFileSystem extends FilterFileSystem {
   public FSDataOutputStream create(Path f, FsPermission permission,
       boolean overwrite, int bufferSize, short replication, long blockSize,
       Progressable progress) throws IOException {
+    return create(f, permission, overwrite, true, bufferSize, 
+        replication, blockSize, progress);
+  }
+
+  private FSDataOutputStream create(Path f, FsPermission permission,
+      boolean overwrite, boolean createParent, int bufferSize, 
+      short replication, long blockSize,
+      Progressable progress) throws IOException {
     Path parent = f.getParent();
-    if (parent != null && !mkdirs(parent)) {
-      throw new IOException("Mkdirs failed to create " + parent);
+    if (parent != null) {
+      if (!createParent && !exists(parent)) {
+        throw new FileNotFoundException("Parent directory doesn't exist: "
+            + parent);
+      } else if (!mkdirs(parent)) {
+        throw new IOException("Mkdirs failed to create " + parent);
+      }
     }
     final FSDataOutputStream out = new FSDataOutputStream(
         new ChecksumFSOutputSummer(this, f, overwrite, bufferSize, replication,
@@ -372,6 +385,15 @@ public abstract class ChecksumFileSystem extends FilterFileSystem {
       setPermission(f, permission);
     }
     return out;
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public FSDataOutputStream createNonRecursive(Path f, FsPermission permission,
+      boolean overwrite, int bufferSize, short replication, long blockSize,
+      Progressable progress) throws IOException {
+    return create(f, permission, overwrite, false, bufferSize, replication, 
+        blockSize, progress);
   }
 
   /**

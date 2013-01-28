@@ -25,11 +25,15 @@ interface MRConstants {
   //
   // Timeouts, constants
   //
-  public static final int HEARTBEAT_INTERVAL_MIN = 3 * 1000;
+  public static final int HEARTBEAT_INTERVAL_MIN = 300;
   
-  public static final int CLUSTER_INCREMENT = 100;
-
   public static final long COUNTER_UPDATE_INTERVAL = 60 * 1000;
+
+  /**
+   * How often TaskTracker needs to check the health of its disks, if not
+   * configured using mapred.disk.healthChecker.interval
+   */
+  public static final long DEFAULT_DISK_HEALTH_CHECK_INTERVAL = 60 * 1000;
 
   //
   // Result codes

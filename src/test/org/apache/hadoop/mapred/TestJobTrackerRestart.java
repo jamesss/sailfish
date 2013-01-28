@@ -17,23 +17,31 @@
  */
 package org.apache.hadoop.mapred;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.*;
-import org.apache.hadoop.hdfs.MiniDFSCluster;
-import org.apache.hadoop.mapred.UtilsForTests;
-import org.apache.hadoop.security.UserGroupInformation;
+import static org.junit.Assert.*;
 
-import junit.framework.TestCase;
-import java.io.*;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.hadoop.mapred.QueueManager.QueueACL;
+import org.apache.hadoop.mapred.UtilsForTests.HalfWaitingMapper;
+import org.apache.hadoop.mapred.UtilsForTests.WaitingReducer;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.junit.Ignore;
+import org.junit.Test;
 /** 
  * TestJobTrackerRestart checks if the jobtracker can restart. JobTracker 
  * should be able to continue running the previously running jobs and also 
  * recover previosuly submitted jobs.
  */
-public class TestJobTrackerRestart extends TestCase {
+/**UNTIL MAPREDUCE-873 is backported, we will not run recovery manager tests
+ */
+@Ignore
+public class TestJobTrackerRestart {
   static final Path testDir = 
     new Path(System.getProperty("test.build.data","/tmp"), 
              "jt-restart-testing");
@@ -92,6 +100,7 @@ public class TestJobTrackerRestart extends TestCase {
    * 
    * Check if the job is missing
    */
+  @Test
   public void testRestartWithoutRecovery(MiniDFSCluster dfs, 
                                          MiniMRCluster mr) 
   throws IOException {
@@ -186,6 +195,7 @@ public class TestJobTrackerRestart extends TestCase {
    *    - Check if the counters can be accessed
    *    - Check if the history files are (re)named properly
    */
+  @Test
   public void testTaskEventsAndReportsWithRecovery(MiniDFSCluster dfs, 
                                                    MiniMRCluster mr) 
   throws IOException {
@@ -320,46 +330,7 @@ public class TestJobTrackerRestart extends TestCase {
     assertTrue("Cluster status is insane", 
                checkClusterStatusOnCompletion(status, prevStatus));
   }
-  
-  /**
-   * Checks if the history files are as expected
-   * @param id job id
-   * @param conf job conf
-   */
-  private void testJobHistoryFiles(JobID id, JobConf conf) 
-  throws IOException  {
-    // Get the history files for users
-    String logFileName = JobHistory.JobInfo.getJobHistoryFileName(conf, id);
-    String tempLogFileName = 
-      JobHistory.JobInfo.getSecondaryJobHistoryFile(logFileName);
-    
-    // I. User files
-    Path logFile = 
-      JobHistory.JobInfo.getJobHistoryLogLocationForUser(logFileName, conf);
-    FileSystem fileSys = logFile.getFileSystem(conf);
-    
-    // Check if the history file exists
-    assertTrue("User log file does not exist", fileSys.exists(logFile));
-    
-    // Check if the temporary file is deleted
-    Path tempLogFile = 
-      JobHistory.JobInfo.getJobHistoryLogLocationForUser(tempLogFileName, 
-                                                         conf);
-    assertFalse("User temporary log file exists", fileSys.exists(tempLogFile));
-    
-    // II. Framework files
-    // Get the history file
-    logFile = JobHistory.JobInfo.getJobHistoryLogLocation(logFileName);
-    fileSys = logFile.getFileSystem(conf);
-    
-    // Check if the history file exists
-    assertTrue("Log file does not exist", fileSys.exists(logFile));
-    
-    // Check if the temporary file is deleted
-    tempLogFile = JobHistory.JobInfo.getJobHistoryLogLocation(tempLogFileName);
-    assertFalse("Temporary log file exists", fileSys.exists(tempLogFile));
-  }
-  
+
   /**
    * Matches specified number of task reports.
    * @param source the reports to be matched
@@ -439,6 +410,7 @@ public class TestJobTrackerRestart extends TestCase {
    * 
    * Assumption that map slots are given first for setup.
    */
+  @Test
   public void testJobRecoveryWithEmptyHistory(MiniDFSCluster dfs, 
                                               MiniMRCluster mr) 
   throws IOException {
@@ -485,6 +457,11 @@ public class TestJobTrackerRestart extends TestCase {
     String history = 
       JobHistory.JobInfo.getJobHistoryFileName(jip.getJobConf(), id);
     Path historyPath = JobHistory.JobInfo.getJobHistoryLogLocation(history);
+    // get the conf file name
+    String parts[] = history.split("_");
+    // jobtracker-hostname_jobtracker-identifier_conf.xml
+    String jobUniqueString = parts[0] + "_" + parts[1] + "_" +  id;
+    Path confPath = new Path(historyPath.getParent(), jobUniqueString + "_conf.xml");
     
     //  make sure that setup is launched
     while (jip.runningMaps() == 0) {
@@ -519,8 +496,13 @@ public class TestJobTrackerRestart extends TestCase {
     
     job1.waitForCompletion();
     job2.waitForCompletion();
+
+    // check if the old files are deleted
+    assertFalse("Old jobhistory file is not deleted", historyFS.exists(historyPath));
+    assertFalse("Old jobconf file is not deleted", historyFS.exists(confPath));
   }
   
+  @Test
   public void testJobTrackerRestart() throws IOException {
     String namenode = null;
     MiniDFSCluster dfs = null;
@@ -558,10 +540,11 @@ public class TestJobTrackerRestart extends TestCase {
       jtConf.set("mapred.jobtracker.job.history.buffer.size", "1024");
       jtConf.setInt("mapred.tasktracker.reduce.tasks.maximum", 1);
       jtConf.setLong("mapred.tasktracker.expiry.interval", 25 * 1000);
-      jtConf.setBoolean("mapred.acls.enabled", true);
+      jtConf.setBoolean(JobConf.MR_ACLS_ENABLED, true);
       // get the user group info
-      UserGroupInformation ugi = UserGroupInformation.getCurrentUGI();
-      jtConf.set("mapred.queue.default.acl-submit-job", ugi.getUserName());
+      UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+      jtConf.set(QueueManager.toFullPropertyName("default",
+          QueueACL.SUBMIT_JOB.getAclName()), ugi.getUserName());
       
       mr = new MiniMRCluster(1, namenode, 1, null, null, jtConf);
       

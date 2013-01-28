@@ -29,32 +29,16 @@ import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
-import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.datanode.SimulatedFSDataset;
-import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
-import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
-import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.security.AccessControlException;
-import org.apache.hadoop.security.UnixUserGroupInformation;
 import org.apache.hadoop.security.UserGroupInformation;
-
-import org.apache.commons.logging.impl.Log4JLogger;
-import org.apache.log4j.Level;
 
 /**
  * This class tests the building blocks that are needed to
  * support HDFS appends.
  */
 public class TestFileAppend2 extends TestCase {
-
-  {
-    ((Log4JLogger)NameNode.stateChangeLog).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)LeaseManager.LOG).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)FSNamesystem.LOG).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)DataNode.LOG).getLogger().setLevel(Level.ALL);
-    ((Log4JLogger)DFSClient.LOG).getLogger().setLevel(Level.ALL);
-  }
 
   static final int blockSize = 1024;
   static final int numBlocks = 5;
@@ -67,11 +51,7 @@ public class TestFileAppend2 extends TestCase {
   int numberOfFiles = 50;
   int numThreads = 10;
   int numAppendsPerThread = 20;
-/***
-  int numberOfFiles = 1;
-  int numThreads = 1;
-  int numAppendsPerThread = 2000;
-****/
+  int artificialBlockReceivedDelay = 50;
   Workload[] workload = null;
   ArrayList<Path> testFiles = new ArrayList<Path>();
   volatile static boolean globalStatus = true;
@@ -123,12 +103,12 @@ public class TestFileAppend2 extends TestCase {
    * Verify that all data exists in file.
    */ 
   public void testSimpleAppend() throws IOException {
-    Configuration conf = new Configuration();
+    final Configuration conf = new Configuration();
     if (simulatedStorage) {
       conf.setBoolean(SimulatedFSDataset.CONFIG_PROPERTY_SIMULATED, true);
     }
     conf.setInt("dfs.datanode.handler.count", 50);
-    conf.setBoolean("dfs.support.append", true);
+    conf.setBoolean("dfs.support.broken.append", true);
     initBuffer(fileSize);
     MiniDFSCluster cluster = new MiniDFSCluster(conf, 1, true, null);
     FileSystem fs = cluster.getFileSystem();
@@ -194,16 +174,15 @@ public class TestFileAppend2 extends TestCase {
         fs.close();
 
         // login as a different user
-        final UserGroupInformation superuser = UserGroupInformation.getCurrentUGI();
+        final UserGroupInformation superuser = UserGroupInformation.getCurrentUser();
         String username = "testappenduser";
         String group = "testappendgroup";
-        assertFalse(superuser.getUserName().equals(username));
+        assertFalse(superuser.getShortUserName().equals(username));
         assertFalse(Arrays.asList(superuser.getGroupNames()).contains(group));
-        UnixUserGroupInformation appenduser = UnixUserGroupInformation.createImmutable(
-            new String[]{username, group});
-        UnixUserGroupInformation.saveToConf(conf,
-            UnixUserGroupInformation.UGI_PROPERTY_NAME, appenduser);
-        fs = FileSystem.get(conf);
+        UserGroupInformation appenduser = 
+          UserGroupInformation.createUserForTesting(username, new String[]{group});
+        
+        fs = DFSTestUtil.getFileSystemAs(appenduser, conf);
 
         // create a file
         Path dir = new Path(root, getClass().getSimpleName());
@@ -378,11 +357,14 @@ public class TestFileAppend2 extends TestCase {
     conf.setInt("dfs.socket.timeout", 30000);
     conf.setInt("dfs.datanode.socket.write.timeout", 30000);
     conf.setInt("dfs.datanode.handler.count", 50);
-    conf.setBoolean("dfs.support.append", true);
+    conf.setInt("dfs.datanode.artificialBlockReceivedDelay",
+                artificialBlockReceivedDelay);
+    conf.setBoolean("dfs.support.broken.append", true);
 
     MiniDFSCluster cluster = new MiniDFSCluster(conf, numDatanodes, 
                                                 true, null);
     cluster.waitActive();
+
     FileSystem fs = cluster.getFileSystem();
 
     try {

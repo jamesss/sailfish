@@ -145,7 +145,7 @@ class DataBlockScanner implements Runnable {
     // initialized when the scanner thread is started.
   }
   
-  private synchronized boolean isInitiliazed() {
+  private synchronized boolean isInitialized() {
     return throttler != null;
   }
   
@@ -248,13 +248,14 @@ class DataBlockScanner implements Runnable {
      */
     long period = Math.min(scanPeriod, 
                            Math.max(blockMap.size(),1) * 600 * 1000L);
+    int periodInt = Math.abs((int)period);
     return System.currentTimeMillis() - scanPeriod + 
-           random.nextInt((int)period);    
+           random.nextInt(periodInt);    
   }
 
   /** Adds block to list of blocks */
   synchronized void addBlock(Block block) {
-    if (!isInitiliazed()) {
+    if (!isInitialized()) {
       return;
     }
     
@@ -273,7 +274,7 @@ class DataBlockScanner implements Runnable {
   
   /** Deletes the block from internal structures */
   synchronized void deleteBlock(Block block) {
-    if (!isInitiliazed()) {
+    if (!isInitialized()) {
       return;
     }
     BlockScanInfo info = blockMap.get(block);
@@ -284,7 +285,7 @@ class DataBlockScanner implements Runnable {
 
   /** @return the last scan time */
   synchronized long getLastScanTime(Block block) {
-    if (!isInitiliazed()) {
+    if (!isInitialized()) {
       return 0;
     }
     BlockScanInfo info = blockMap.get(block);
@@ -298,18 +299,45 @@ class DataBlockScanner implements Runnable {
     }
   }
   
-  void verifiedByClient(Block block) {
-    updateScanStatus(block, ScanType.REMOTE_READ, true);
+  /*
+   * A reader will try to indicate a block is verified and will add blocks to
+   * the DataBlockScanner before they are finished (due to concurrent readers).
+   * 
+   * fixed so a read verification can't add the block
+   */
+  synchronized void verifiedByClient(Block block) {
+    updateScanStatusInternal(block, ScanType.REMOTE_READ, true, true);
   }
   
-  private synchronized void updateScanStatus(Block block, 
-                                             ScanType type,
-                                             boolean scanOk) {
+  private synchronized void updateScanStatus(Block block, ScanType type,
+      boolean scanOk) {
+    updateScanStatusInternal(block, type, scanOk, false);
+  }
+      
+  /**
+   * @param block
+   *          - block to update status for
+   * @param type
+   *          - client, DN, ...
+   * @param scanOk
+   *          - result of scan
+   * @param updateOnly
+   *          - if true, cannot add a block, but only update an existing block
+   */
+  private synchronized void updateScanStatusInternal(Block block,
+      ScanType type, boolean scanOk, boolean updateOnly) {
+
+    if (!isInitialized()) {
+      return;
+    }
     BlockScanInfo info = blockMap.get(block);
     
     if ( info != null ) {
       delBlockInfo(info);
     } else {
+      if (updateOnly) {
+        return;
+      }
       // It might already be removed. Thats ok, it will be caught next time.
       info = new BlockScanInfo(block);
     }
@@ -459,13 +487,13 @@ class DataBlockScanner implements Runnable {
                  StringUtils.stringifyException(e));
         
         if (second) {
-          datanode.getMetrics().blockVerificationFailures.inc(); 
+          datanode.getMetrics().incrBlockVerificationFailures();
           handleScanFailure(block);
           return;
         } 
       } finally {
         IOUtils.closeStream(blockSender);
-        datanode.getMetrics().blocksVerified.inc();
+        datanode.getMetrics().incrBlocksVerified();
         totalScans++;
         totalVerifications++;
       }
@@ -611,7 +639,7 @@ class DataBlockScanner implements Runnable {
       log.close();
     }
   }
-  
+
   synchronized void printBlockReport(StringBuilder buffer, 
                                      boolean summaryOnly) {
     long oneHour = 3600*1000;
@@ -758,6 +786,9 @@ class DataBlockScanner implements Runnable {
      * return true if append was successful.
      */
     synchronized boolean appendLine(String line) {
+      if (out == null) {
+        return false;
+      }
       out.println();
       out.print(line);
       curNumLines += (curNumLines < 0) ? -1 : 1;
@@ -955,7 +986,7 @@ class DataBlockScanner implements Runnable {
       if (blockScanner == null) {
         buffer.append("Periodic block scanner is not running. " +
                       "Please check the datanode log if this is unexpected.");
-      } else if (blockScanner.isInitiliazed()) {
+      } else if (blockScanner.isInitialized()) {
         blockScanner.printBlockReport(buffer, summary);
       } else {
         buffer.append("Periodic block scanner is not yet initialized. " +

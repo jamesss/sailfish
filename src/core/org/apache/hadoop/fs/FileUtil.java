@@ -22,8 +22,13 @@ import java.io.*;
 import java.util.Enumeration;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.permission.FsAction;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.nativeio.NativeIO;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.Shell.ShellCommandExecutor;
@@ -32,6 +37,8 @@ import org.apache.hadoop.util.Shell.ShellCommandExecutor;
  * A collection of file-processing util methods
  */
 public class FileUtil {
+  private static final Log LOG = LogFactory.getLog(FileUtil.class);
+
   /**
    * convert an array of FileStatus to an array of Path
    * 
@@ -70,12 +77,25 @@ public class FileUtil {
    * we return false, the directory may be partially-deleted.
    */
   public static boolean fullyDelete(File dir) throws IOException {
+    if (!fullyDeleteContents(dir)) {
+      return false;
+    }
+    return dir.delete();
+  }
+
+  /**
+   * Delete the contents of a directory, not the directory itself.  If
+   * we return false, the directory may be partially-deleted.
+   */
+  public static boolean fullyDeleteContents(File dir) throws IOException {
+    boolean deletionSucceeded = true;
     File contents[] = dir.listFiles();
     if (contents != null) {
       for (int i = 0; i < contents.length; i++) {
         if (contents[i].isFile()) {
           if (!contents[i].delete()) {
-            return false;
+            deletionSucceeded = false;
+            continue; // continue deletion of other files/dirs under dir
           }
         } else {
           //try deleting the directory
@@ -89,12 +109,13 @@ public class FileUtil {
           // if not an empty directory or symlink let
           // fullydelete handle it.
           if (!fullyDelete(contents[i])) {
-            return false;
+            deletionSucceeded = false;
+            continue; // continue deletion of other files/dirs under dir
           }
         }
       }
     }
-    return dir.delete();
+    return deletionSucceeded;
   }
 
   /**
@@ -273,7 +294,7 @@ public class FileUtil {
       if (!dstFS.mkdirs(dst)) {
         return false;
       }
-      File contents[] = src.listFiles();
+      File contents[] = listFiles(src);
       for (int i = 0; i < contents.length; i++) {
         copy(contents[i], dstFS, new Path(dst, contents[i].getName()),
              deleteSource, conf);
@@ -427,10 +448,19 @@ public class FileUtil {
     if (!dir.isDirectory()) {
       return dir.length();
     } else {
-      size = dir.length();
       File[] allFiles = dir.listFiles();
-      for (int i = 0; i < allFiles.length; i++) {
-        size = size + getDU(allFiles[i]);
+      if(allFiles != null) {
+        for (int i = 0; i < allFiles.length; i++) {
+          boolean isSymLink;
+          try {
+            isSymLink = org.apache.commons.io.FileUtils.isSymlink(allFiles[i]);
+          } catch(IOException ioe) {
+            isSymLink = true;
+          }
+          if(!isSymLink) {
+            size += getDU(allFiles[i]);
+          }
+        }
       }
       return size;
     }
@@ -526,144 +556,6 @@ public class FileUtil {
   }
 
   /**
-   * Class for creating hardlinks.
-   * Supports Unix, Cygwin, WindXP.
-   *  
-   */
-  public static class HardLink { 
-    enum OSType {
-      OS_TYPE_UNIX, 
-      OS_TYPE_WINXP,
-      OS_TYPE_SOLARIS,
-      OS_TYPE_MAC; 
-    }
-  
-    private static String[] hardLinkCommand;
-    private static String[] getLinkCountCommand;
-    private static OSType osType;
-    
-    static {
-      osType = getOSType();
-      switch(osType) {
-      case OS_TYPE_WINXP:
-        hardLinkCommand = new String[] {"fsutil","hardlink","create", null, null};
-        getLinkCountCommand = new String[] {"stat","-c%h"};
-        break;
-      case OS_TYPE_SOLARIS:
-        hardLinkCommand = new String[] {"ln", null, null};
-        getLinkCountCommand = new String[] {"ls","-l"};
-        break;
-      case OS_TYPE_MAC:
-        hardLinkCommand = new String[] {"ln", null, null};
-        getLinkCountCommand = new String[] {"stat","-f%l"};
-        break;
-      case OS_TYPE_UNIX:
-      default:
-        hardLinkCommand = new String[] {"ln", null, null};
-        getLinkCountCommand = new String[] {"stat","-c%h"};
-      }
-    }
-
-    static private OSType getOSType() {
-      String osName = System.getProperty("os.name");
-      if (osName.indexOf("Windows") >= 0 && 
-          (osName.indexOf("XP") >= 0 || osName.indexOf("2003") >= 0 || osName.indexOf("Vista") >= 0))
-        return OSType.OS_TYPE_WINXP;
-      else if (osName.indexOf("SunOS") >= 0)
-         return OSType.OS_TYPE_SOLARIS;
-      else if (osName.indexOf("Mac") >= 0)
-         return OSType.OS_TYPE_MAC;
-      else
-        return OSType.OS_TYPE_UNIX;
-    }
-    
-    /**
-     * Creates a hardlink 
-     */
-    public static void createHardLink(File target, 
-                                      File linkName) throws IOException {
-      int len = hardLinkCommand.length;
-      if (osType == OSType.OS_TYPE_WINXP) {
-       hardLinkCommand[len-1] = target.getCanonicalPath();
-       hardLinkCommand[len-2] = linkName.getCanonicalPath();
-      } else {
-       hardLinkCommand[len-2] = makeShellPath(target, true);
-       hardLinkCommand[len-1] = makeShellPath(linkName, true);
-      }
-      // execute shell command
-      Process process = Runtime.getRuntime().exec(hardLinkCommand);
-      try {
-        if (process.waitFor() != 0) {
-          String errMsg = new BufferedReader(new InputStreamReader(
-                                                                   process.getInputStream())).readLine();
-          if (errMsg == null)  errMsg = "";
-          String inpMsg = new BufferedReader(new InputStreamReader(
-                                                                   process.getErrorStream())).readLine();
-          if (inpMsg == null)  inpMsg = "";
-          throw new IOException(errMsg + inpMsg);
-        }
-      } catch (InterruptedException e) {
-        throw new IOException(StringUtils.stringifyException(e));
-      } finally {
-        process.destroy();
-      }
-    }
-
-    /**
-     * Retrieves the number of links to the specified file.
-     */
-    public static int getLinkCount(File fileName) throws IOException {
-      int len = getLinkCountCommand.length;
-      String[] cmd = new String[len + 1];
-      for (int i = 0; i < len; i++) {
-        cmd[i] = getLinkCountCommand[i];
-      }
-      cmd[len] = fileName.toString();
-      String inpMsg = "";
-      String errMsg = "";
-      int exitValue = -1;
-      BufferedReader in = null;
-      BufferedReader err = null;
-
-      // execute shell command
-      Process process = Runtime.getRuntime().exec(cmd);
-      try {
-        exitValue = process.waitFor();
-        in = new BufferedReader(new InputStreamReader(
-                                    process.getInputStream()));
-        inpMsg = in.readLine();
-        if (inpMsg == null)  inpMsg = "";
-        
-        err = new BufferedReader(new InputStreamReader(
-                                     process.getErrorStream()));
-        errMsg = err.readLine();
-        if (errMsg == null)  errMsg = "";
-        if (exitValue != 0) {
-          throw new IOException(inpMsg + errMsg);
-        }
-        if (getOSType() == OSType.OS_TYPE_SOLARIS) {
-          String[] result = inpMsg.split("\\s+");
-          return Integer.parseInt(result[1]);
-        } else {
-          return Integer.parseInt(inpMsg);
-        }
-      } catch (NumberFormatException e) {
-        throw new IOException(StringUtils.stringifyException(e) + 
-                              inpMsg + errMsg +
-                              " on file:" + fileName);
-      } catch (InterruptedException e) {
-        throw new IOException(StringUtils.stringifyException(e) + 
-                              inpMsg + errMsg +
-                              " on file:" + fileName);
-      } finally {
-        process.destroy();
-        if (in != null) in.close();
-        if (err != null) err.close();
-      }
-    }
-  }
-
-  /**
    * Create a soft link between a src and destination
    * only on a local disk. HDFS does not support this
    * @param target the target for symlink 
@@ -679,9 +571,25 @@ public class FileUtil {
     } catch(InterruptedException e){
       //do nothing as of yet
     }
+    if (returnVal != 0) {
+      LOG.warn("Command '" + cmd + "' failed " + returnVal + 
+               " with: " + copyStderr(p));
+    }
     return returnVal;
   }
   
+  private static String copyStderr(Process p) throws IOException {
+    InputStream err = p.getErrorStream();
+    StringBuilder result = new StringBuilder();
+    byte[] buff = new byte[4096];
+    int len = err.read(buff);
+    while (len > 0) {
+      result.append(new String(buff, 0 , len));
+      len = err.read(buff);
+    }
+    return result.toString();
+  }
+
   /**
    * Change the permissions on a filename.
    * @param filename the name of the file to change
@@ -692,11 +600,117 @@ public class FileUtil {
    */
   public static int chmod(String filename, String perm
                           ) throws IOException, InterruptedException {
-    String cmd = "chmod " + perm + " " + filename;
-    Process p = Runtime.getRuntime().exec(cmd, null);
-    return p.waitFor();
+    return chmod(filename, perm, false);
   }
 
+  /**
+   * Change the permissions on a file / directory, recursively, if
+   * needed.
+   * @param filename name of the file whose permissions are to change
+   * @param perm permission string
+   * @param recursive true, if permissions should be changed recursively
+   * @return the exit code from the command.
+   * @throws IOException
+   * @throws InterruptedException
+   */
+  public static int chmod(String filename, String perm, boolean recursive)
+                            throws IOException {
+    StringBuffer cmdBuf = new StringBuffer();
+    cmdBuf.append("chmod ");
+    if (recursive) {
+      cmdBuf.append("-R ");
+    }
+    cmdBuf.append(perm).append(" ");
+    cmdBuf.append(filename);
+    String[] shellCmd = {"bash", "-c" ,cmdBuf.toString()};
+    ShellCommandExecutor shExec = new ShellCommandExecutor(shellCmd);
+    try {
+      shExec.execute();
+    }catch(IOException e) {
+      if(LOG.isDebugEnabled()) {
+        LOG.debug("Error while changing permission : " + filename 
+                  +" Exception: " + StringUtils.stringifyException(e));
+      }
+    }
+    return shExec.getExitCode();
+  }
+
+  /**
+   * Set permissions to the required value. Uses the java primitives instead
+   * of forking if group == other.
+   * @param f the file to change
+   * @param permission the new permissions
+   * @throws IOException
+   */
+  public static void setPermission(File f, FsPermission permission
+                                   ) throws IOException {
+    FsAction user = permission.getUserAction();
+    FsAction group = permission.getGroupAction();
+    FsAction other = permission.getOtherAction();
+
+    // use the native/fork if the group/other permissions are different
+    // or if the native is available    
+    if (group != other || NativeIO.isAvailable()) {
+      execSetPermission(f, permission);
+      return;
+    }
+    
+    boolean rv = true;
+    
+    // read perms
+    rv = f.setReadable(group.implies(FsAction.READ), false);
+    checkReturnValue(rv, f, permission);
+    if (group.implies(FsAction.READ) != user.implies(FsAction.READ)) {
+      f.setReadable(user.implies(FsAction.READ), true);
+      checkReturnValue(rv, f, permission);
+    }
+
+    // write perms
+    rv = f.setWritable(group.implies(FsAction.WRITE), false);
+    checkReturnValue(rv, f, permission);
+    if (group.implies(FsAction.WRITE) != user.implies(FsAction.WRITE)) {
+      f.setWritable(user.implies(FsAction.WRITE), true);
+      checkReturnValue(rv, f, permission);
+    }
+
+    // exec perms
+    rv = f.setExecutable(group.implies(FsAction.EXECUTE), false);
+    checkReturnValue(rv, f, permission);
+    if (group.implies(FsAction.EXECUTE) != user.implies(FsAction.EXECUTE)) {
+      f.setExecutable(user.implies(FsAction.EXECUTE), true);
+      checkReturnValue(rv, f, permission);
+    }
+  }
+
+  private static void checkReturnValue(boolean rv, File p, 
+                                       FsPermission permission
+                                       ) throws IOException {
+    if (!rv) {
+      throw new IOException("Failed to set permissions of path: " + p + 
+                            " to " + 
+                            String.format("%04o", permission.toShort()));
+    }
+  }
+  
+  private static void execSetPermission(File f, 
+                                        FsPermission permission
+                                       )  throws IOException {
+    if (NativeIO.isAvailable()) {
+      NativeIO.chmod(f.getCanonicalPath(), permission.toShort());
+    } else {
+      execCommand(f, Shell.SET_PERMISSION_COMMAND,
+                  String.format("%04o", permission.toShort()));
+    }
+  }
+  
+  static String execCommand(File f, String... cmd) throws IOException {
+    String[] args = new String[cmd.length + 1];
+    System.arraycopy(cmd, 0, args, 0, cmd.length);
+    args[cmd.length] = f.getCanonicalPath();
+    String output = Shell.execCommand(args);
+    return output;
+  }
+  
   /**
    * Create a tmp file for a base file.
    * @param basefile the base file of the tmp
@@ -746,4 +760,42 @@ public class FileUtil {
       }
     }
   }
+
+  /**
+   * A wrapper for {@link File#listFiles()}. This java.io API returns null 
+   * when a dir is not a directory or for any I/O error. Instead of having
+   * null check everywhere File#listFiles() is used, we will add utility API
+   * to get around this problem. For the majority of cases where we prefer 
+   * an IOException to be thrown.
+   * @param dir directory for which listing should be performed
+   * @return list of files or empty list
+   * @exception IOException for invalid directory or for a bad disk.
+   */
+  public static File[] listFiles(File dir) throws IOException {
+    File[] files = dir.listFiles();
+    if(files == null) {
+      throw new IOException("Invalid directory or I/O error occurred for dir: "
+                + dir.toString());
+    }
+    return files;
+  }
+  
+  /**
+   * A wrapper for {@link File#list()}. This java.io API returns null 
+   * when a dir is not a directory or for any I/O error. Instead of having
+   * null check everywhere File#list() is used, we will add utility API
+   * to get around this problem. For the majority of cases where we prefer 
+   * an IOException to be thrown.
+   * @param dir directory for which listing should be performed
+   * @return list of file names or empty string list
+   * @exception IOException for invalid directory or for a bad disk.
+   */
+  public static String[] list(File dir) throws IOException {
+    String[] fileNames = dir.list();
+    if(fileNames == null) {
+      throw new IOException("Invalid directory or I/O error occurred for dir: "
+                + dir.toString());
+    }
+    return fileNames;
+  }  
 }

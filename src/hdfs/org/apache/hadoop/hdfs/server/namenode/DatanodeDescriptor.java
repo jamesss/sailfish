@@ -25,6 +25,7 @@ import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.server.common.GenerationStamp;
 import org.apache.hadoop.hdfs.server.namenode.BlocksMap.BlockInfo;
 import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol;
@@ -44,6 +45,11 @@ import org.apache.hadoop.io.WritableUtils;
 
  **************************************************/
 public class DatanodeDescriptor extends DatanodeInfo {
+  
+  // Stores status of decommissioning.
+  // If node is not decommissioning, do not use this object for anything.
+  DecommissioningStatus decommissioningStatus = new DecommissioningStatus();
+
   /** Block and targets pair */
   public static class BlockTargetPair {
     public final Block block;
@@ -85,6 +91,15 @@ public class DatanodeDescriptor extends DatanodeInfo {
   // isAlive == heartbeats.contains(this)
   // This is an optimization, because contains takes O(n) time on Arraylist
   protected boolean isAlive = false;
+  protected boolean needKeyUpdate = false;
+
+  // A system administrator can tune the balancer bandwidth parameter
+  // (dfs.balance.bandwidthPerSec) dynamically by calling
+  // "dfsadmin -setBalanacerBandwidth <newbandwidth>", at which point the
+  // following 'bandwidth' variable gets updated with the new value for each
+  // node. Once the heartbeat command is issued to update the value on the
+  // specified datanode, this value will be set back to 0.
+  private long bandwidth;
 
   /** A queue of blocks to be replicated by this datanode */
   private BlockQueue replicateBlocks = new BlockQueue();
@@ -102,6 +117,9 @@ public class DatanodeDescriptor extends DatanodeInfo {
   private int prevApproxBlocksScheduled = 0;
   private long lastBlocksScheduledRollTime = 0;
   private static final int BLOCKS_SCHEDULED_ROLL_INTERVAL = 600*1000; //10min
+  
+  // Set to false after processing first block report
+  private boolean firstBlockReport = true; 
   
   /** Default constructor */
   public DatanodeDescriptor() {}
@@ -377,10 +395,27 @@ public class DatanodeDescriptor extends DatanodeInfo {
     // Note we are taking special precaution to limit tmp blocks allocated
     // as part this block report - which why block list is stored as longs
     Block iblk = new Block(); // a fixed new'ed block to be reused with index i
+    Block oblk = new Block(); // for fixing genstamps
     for (int i = 0; i < newReport.getNumberOfBlocks(); ++i) {
       iblk.set(newReport.getBlockId(i), newReport.getBlockLen(i), 
                newReport.getBlockGenStamp(i));
       BlockInfo storedBlock = blocksMap.getStoredBlock(iblk);
+      if(storedBlock == null) {
+        // if the block with a WILDCARD generation stamp matches 
+        // then accept this block.
+        // This block has a diferent generation stamp on the datanode 
+        // because of a lease-recovery-attempt.
+        oblk.set(newReport.getBlockId(i), newReport.getBlockLen(i),
+                 GenerationStamp.WILDCARD_STAMP);
+        storedBlock = blocksMap.getStoredBlock(oblk);
+        if (storedBlock != null && storedBlock.getINode() != null &&
+            (storedBlock.getGenerationStamp() <= iblk.getGenerationStamp() ||
+             storedBlock.getINode().isUnderConstruction())) {
+          // accept block. It wil be cleaned up on cluster restart.
+        } else {
+          storedBlock = null;
+        }
+      }
       if(storedBlock == null) {
         // If block is not in blocksMap it does not belong to any file
         toInvalidate.add(new Block(iblk));
@@ -403,8 +438,13 @@ public class DatanodeDescriptor extends DatanodeInfo {
     // collect blocks that have not been reported
     // all of them are next to the delimiter
     Iterator<Block> it = new BlockIterator(delimiter.getNext(0), this);
-    while(it.hasNext())
-      toRemove.add(it.next());
+    while(it.hasNext()) {
+      BlockInfo storedBlock = (BlockInfo)it.next();
+      INodeFile file = storedBlock.getINode();
+      if (file == null || !file.isUnderConstruction()) {
+        toRemove.add(storedBlock);
+      }
+    }
     this.removeBlock(delimiter);
   }
 
@@ -461,5 +501,75 @@ public class DatanodeDescriptor extends DatanodeInfo {
       currApproxBlocksScheduled = 0;
       lastBlocksScheduledRollTime = now;
     }
+  }
+  
+  class DecommissioningStatus {
+    int underReplicatedBlocks;
+    int decommissionOnlyReplicas;
+    int underReplicatedInOpenFiles;
+    long startTime;
+
+    synchronized void set(int underRep, int onlyRep, int underConstruction) {
+      if (isDecommissionInProgress() == false) {
+        return;
+      }
+      underReplicatedBlocks = underRep;
+      decommissionOnlyReplicas = onlyRep;
+      underReplicatedInOpenFiles = underConstruction;
+    }
+
+    synchronized int getUnderReplicatedBlocks() {
+      if (isDecommissionInProgress() == false) {
+        return 0;
+      }
+      return underReplicatedBlocks;
+    }
+
+    synchronized int getDecommissionOnlyReplicas() {
+      if (isDecommissionInProgress() == false) {
+        return 0;
+      }
+      return decommissionOnlyReplicas;
+    }
+
+    synchronized int getUnderReplicatedInOpenFiles() {
+      if (isDecommissionInProgress() == false) {
+        return 0;
+      }
+      return underReplicatedInOpenFiles;
+    }
+
+    synchronized void setStartTime(long time) {
+      startTime = time;
+    }
+
+    synchronized long getStartTime() {
+      if (isDecommissionInProgress() == false) {
+        return 0;
+      }
+      return startTime;
+    }
+  } // End of class DecommissioningStatus
+  
+  /**
+   * @return Blanacer bandwidth in bytes per second for this datanode.
+   */
+  public long getBalancerBandwidth() {
+    return this.bandwidth;
+  }
+  
+  /**
+   * @param bandwidth Blanacer bandwidth in bytes per second for this datanode.
+   */
+  public void setBalancerBandwidth(long bandwidth) {
+    this.bandwidth = bandwidth;
+  }
+
+  boolean firstBlockReport() {
+    return firstBlockReport;
+  }
+  
+  void processedBlockReport() {
+    firstBlockReport = false;
   }
 }

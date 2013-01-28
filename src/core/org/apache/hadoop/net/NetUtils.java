@@ -22,27 +22,34 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
 import java.net.Socket;
 import java.net.SocketAddress;
+import java.net.SocketException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.UnknownHostException;
+import java.net.ConnectException;
 import java.nio.channels.SocketChannel;
 import java.util.Map.Entry;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.net.SocketFactory;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.commons.net.util.SubnetUtils;
+import org.apache.commons.net.util.SubnetUtils.SubnetInfo;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.ipc.VersionedProtocol;
+import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.util.ReflectionUtils;
 
 public class NetUtils {
   private static final Log LOG = LogFactory.getLog(NetUtils.class);
-  
+    
   private static Map<String, String> hostToResolved = 
                                      new HashMap<String, String>();
 
@@ -131,37 +138,117 @@ public class NetUtils {
    */
   public static InetSocketAddress createSocketAddr(String target,
                                                    int defaultPort) {
-    int colonIndex = target.indexOf(':');
-    if (colonIndex < 0 && defaultPort == -1) {
-      throw new RuntimeException("Not a host:port pair: " + target);
+    if (target == null) {
+      throw new IllegalArgumentException("Socket address is null");
     }
-    String hostname;
-    int port = -1;
-    if (!target.contains("/")) {
-      if (colonIndex == -1) {
-        hostname = target;
-      } else {
-        // must be the old style <host>:<port>
-        hostname = target.substring(0, colonIndex);
-        port = Integer.parseInt(target.substring(colonIndex + 1));
-      }
-    } else {
-      // a new uri
-      URI addr = new Path(target).toUri();
-      hostname = addr.getHost();
-      port = addr.getPort();
+    boolean hasScheme = target.contains("://");    
+    URI uri = null;
+    try {
+      uri = hasScheme ? URI.create(target) : URI.create("dummyscheme://"+target);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(
+          "Does not contain a valid host:port authority: " + target
+      );
     }
 
+    String host = uri.getHost();
+    int port = uri.getPort();
     if (port == -1) {
       port = defaultPort;
     }
-  
-    if (getStaticResolution(hostname) != null) {
-      hostname = getStaticResolution(hostname);
+    String path = uri.getPath();
+    
+    if ((host == null) || (port < 0) ||
+        (!hasScheme && path != null && !path.isEmpty()))
+    {
+      throw new IllegalArgumentException(
+          "Does not contain a valid host:port authority: " + target
+      );
     }
-    return new InetSocketAddress(hostname, port);
+    return makeSocketAddr(host, port);
   }
+  
+  /**
+   * Create a socket address with the given host and port.  The hostname
+   * might be replaced with another host that was set via
+   * {@link #addStaticResolution(String, String)}.  The value of
+   * hadoop.security.token.service.use_ip will determine whether the
+   * standard java host resolver is used, or if the fully qualified resolver
+   * is used.
+   * @param host the hostname or IP use to instantiate the object
+   * @param port the port number
+   * @return InetSocketAddress
+   */
+  public static InetSocketAddress makeSocketAddr(String host, int port) {
+    String staticHost = getStaticResolution(host);
+    String resolveHost = (staticHost != null) ? staticHost : host;
+    
+    InetSocketAddress addr;
+    try {
+      InetAddress iaddr = SecurityUtil.getByName(resolveHost);
+      // if there is a static entry for the host, make the returned
+      // address look like the original given host
+      if (staticHost != null) {
+        iaddr = InetAddress.getByAddress(host, iaddr.getAddress());
+      }
+      addr = new InetSocketAddress(iaddr, port);
+    } catch (UnknownHostException e) {
+      addr = InetSocketAddress.createUnresolved(host, port);
+    }
+    return addr;
+  }
+  
+  /**
+   * Resolve the uri's hostname and add the default port if not in the uri
+   * @param uri to resolve
+   * @param defaultPort if none is given
+   * @return URI
+   * @throws UnknownHostException 
+   */
+  public static URI getCanonicalUri(URI uri, int defaultPort) {
+    // skip if there is no authority, ie. "file" scheme or relative uri
+    String host = uri.getHost();
+    if (host == null) {
+      return uri;
+    }
+    String fqHost = canonicalizeHost(host);
+    int port = uri.getPort();
+    // short out if already canonical with a port
+    if (host.equals(fqHost) && port != -1) {
+      return uri;
+    }
+    // reconstruct the uri with the canonical host and port
+    try {
+      uri = new URI(uri.getScheme(), uri.getUserInfo(),
+          fqHost, (port == -1) ? defaultPort : port,
+          uri.getPath(), uri.getQuery(), uri.getFragment());
+    } catch (URISyntaxException e) {
+      throw new IllegalArgumentException(e);
+    }
+    return uri;
+  }  
 
+  // cache the canonicalized hostnames;  the cache currently isn't expired,
+  // but the canonicals will only change if the host's resolver configuration
+  // changes
+  private static ConcurrentHashMap<String, String> canonicalizedHostCache =
+      new ConcurrentHashMap<String, String>();
+
+  private static String canonicalizeHost(String host) {
+    // check if the host has already been canonicalized
+    String fqHost = canonicalizedHostCache.get(host);
+    if (fqHost == null) {
+      try {
+        fqHost = SecurityUtil.getByName(host).getHostName();
+        // slight race condition, but won't hurt 
+        canonicalizedHostCache.put(host, fqHost);
+      } catch (UnknownHostException e) {
+        fqHost = host;
+      }
+    }
+    return fqHost;
+  }
+    
   /**
    * Handle the transition from pairs of attributes specifying a host and port
    * to a single colon separated one.
@@ -264,8 +351,8 @@ public class NetUtils {
    */
   public static InetSocketAddress getConnectAddress(Server server) {
     InetSocketAddress addr = server.getListenerAddress();
-    if (addr.getAddress().getHostAddress().equals("0.0.0.0")) {
-      addr = new InetSocketAddress("127.0.0.1", addr.getPort());
+    if (addr.getAddress().isAnyLocalAddress()) {
+      addr = makeSocketAddr("127.0.0.1", addr.getPort());
     }
     return addr;
   }
@@ -281,7 +368,7 @@ public class NetUtils {
    * case, the timeout argument is ignored and the timeout set with 
    * {@link Socket#setSoTimeout(int)} applies for reads.<br><br>
    *
-   * Any socket created using socket factories returned by {@link #NetUtils},
+   * Any socket created using socket factories returned by {@link NetUtils},
    * must use this interface instead of {@link Socket#getInputStream()}.
    *     
    * @see #getInputStream(Socket, long)
@@ -303,7 +390,7 @@ public class NetUtils {
    * case, the timeout argument is ignored and the timeout set with 
    * {@link Socket#setSoTimeout(int)} applies for reads.<br><br>
    * 
-   * Any socket created using socket factories returned by {@link #NetUtils},
+   * Any socket created using socket factories returned by {@link NetUtils},
    * must use this interface instead of {@link Socket#getInputStream()}.
    *     
    * @see Socket#getChannel()
@@ -332,7 +419,7 @@ public class NetUtils {
    * case, the timeout argument is ignored and the write will wait until 
    * data is available.<br><br>
    * 
-   * Any socket created using socket factories returned by {@link #NetUtils},
+   * Any socket created using socket factories returned by {@link NetUtils},
    * must use this interface instead of {@link Socket#getOutputStream()}.
    * 
    * @see #getOutputStream(Socket, long)
@@ -354,7 +441,7 @@ public class NetUtils {
    * case, the timeout argument is ignored and the write will wait until 
    * data is available.<br><br>
    * 
-   * Any socket created using socket factories returned by {@link #NetUtils},
+   * Any socket created using socket factories returned by {@link NetUtils},
    * must use this interface instead of {@link Socket#getOutputStream()}.
    * 
    * @see Socket#getChannel()
@@ -370,7 +457,7 @@ public class NetUtils {
     return (socket.getChannel() == null) ? 
             socket.getOutputStream() : new SocketOutputStream(socket, timeout);            
   }
-  
+
   /**
    * This is a drop-in replacement for 
    * {@link Socket#connect(SocketAddress, int)}.
@@ -385,11 +472,27 @@ public class NetUtils {
    * @see java.net.Socket#connect(java.net.SocketAddress, int)
    * 
    * @param socket
-   * @param endpoint 
-   * @param timeout - timeout in milliseconds
+   * @param address the remote address
+   * @param timeout timeout in milliseconds
+   */
+  public static void connect(Socket socket,
+      SocketAddress address,
+      int timeout) throws IOException {
+    connect(socket, address, null, timeout);
+  }
+
+  /**
+   * Like {@link NetUtils#connect(Socket, SocketAddress, int)} but
+   * also takes a local address and port to bind the socket to. 
+   * 
+   * @param socket
+   * @param endpoint the remote address
+   * @param localAddr the local address to bind the socket to
+   * @param timeout timeout in milliseconds
    */
   public static void connect(Socket socket, 
-                             SocketAddress endpoint, 
+                             SocketAddress endpoint,
+                             SocketAddress localAddr,
                              int timeout) throws IOException {
     if (socket == null || endpoint == null || timeout < 0) {
       throw new IllegalArgumentException("Illegal argument for connect()");
@@ -397,11 +500,30 @@ public class NetUtils {
     
     SocketChannel ch = socket.getChannel();
     
+    if (localAddr != null) {
+      socket.bind(localAddr);
+    }
+
     if (ch == null) {
       // let the default implementation handle it.
       socket.connect(endpoint, timeout);
     } else {
       SocketIOWithTimeout.connect(ch, endpoint, timeout);
+    }
+
+    // There is a very rare case allowed by the TCP specification, such that
+    // if we are trying to connect to an endpoint on the local machine,
+    // and we end up choosing an ephemeral port equal to the destination port,
+    // we will actually end up getting connected to ourself (ie any data we
+    // send just comes right back). This is only possible if the target
+    // daemon is down, so we'll treat it like connection refused.
+    if (socket.getLocalPort() == socket.getPort() &&
+        socket.getLocalAddress().equals(socket.getInetAddress())) {
+      LOG.info("Detected a loopback TCP socket, disconnecting it");
+      socket.close();
+      throw new ConnectException(
+        "Localhost targeted connection resulted in a loopback. " +
+        "No daemon is listening on the target port.");
     }
   }
   
@@ -414,7 +536,7 @@ public class NetUtils {
    * @return its IP address in the string format
    */
   public static String normalizeHostName(String name) {
-    if (Character.digit(name.charAt(0), 16) != -1) { // it is an IP
+    if (Character.digit(name.charAt(0), 10) != -1) { //FIXME 
       return name;
     } else {
       try {
@@ -440,5 +562,123 @@ public class NetUtils {
       hostNames.add(normalizeHostName(name));
     }
     return hostNames;
+  }
+
+  /**
+   * Performs a sanity check on the list of hostnames/IPs to verify they at least
+   * appear to be valid.
+   * @param names - List of hostnames/IPs
+   * @throws UnknownHostException
+   */
+  public static void verifyHostnames(String[] names) throws UnknownHostException {
+    for (String name: names) {
+      if (name == null) {
+        throw new UnknownHostException("null hostname found");
+      }
+      // The first check supports URL formats (e.g. hdfs://, etc.). 
+      // java.net.URI requires a schema, so we add a dummy one if it doesn't
+      // have one already.
+      URI uri = null;
+      try {
+        uri = new URI(name);
+        if (uri.getHost() == null) {
+          uri = new URI("http://" + name);
+        }
+      } catch (URISyntaxException e) {
+        uri = null;
+      }
+      if (uri == null || uri.getHost() == null) {
+        throw new UnknownHostException(name + " is not a valid Inet address");
+      }
+    }
+  }
+
+  /**
+   * Checks if {@code host} is a local host name and return {@link InetAddress}
+   * corresponding to that address.
+   * 
+   * @param host the specified host
+   * @return a valid local {@link InetAddress} or null
+   * @throws SocketException if an I/O error occurs
+   */
+  public static InetAddress getLocalInetAddress(String host)
+      throws SocketException {
+    if (host == null) {
+      return null;
+    }
+    InetAddress addr = null;
+    try {
+      addr = InetAddress.getByName(host);
+      if (NetworkInterface.getByInetAddress(addr) == null) {
+        addr = null; // Not a local address
+      }
+    } catch (UnknownHostException ignore) { }
+    return addr;
+  }
+
+  /**
+   * @return true if the given string is a subnet specified
+   *     using CIDR notation, false otherwise
+   */
+  public static boolean isValidSubnet(String subnet) {
+    try {
+      new SubnetUtils(subnet);
+      return true;
+    } catch (IllegalArgumentException iae) {
+      return false;
+    }
+  }
+
+  /**
+   * Add all addresses associated with the given nif in the
+   * given subnet to the given list.
+   */
+  private static void addMatchingAddrs(NetworkInterface nif,
+      SubnetInfo subnetInfo, List<InetAddress> addrs) {
+    Enumeration<InetAddress> ifAddrs = nif.getInetAddresses();
+    while (ifAddrs.hasMoreElements()) {
+      InetAddress ifAddr = ifAddrs.nextElement();
+      if (subnetInfo.isInRange(ifAddr.getHostAddress())) {
+        addrs.add(ifAddr);
+      }
+    }
+  }
+
+  /**
+   * Return an InetAddress for each interface that matches the
+   * given subnet specified using CIDR notation.
+   *
+   * @param subnet subnet specified using CIDR notation
+   * @param returnSubinterfaces
+   *            whether to return IPs associated with subinterfaces
+   * @throws IllegalArgumentException if subnet is invalid
+   */
+  public static List<InetAddress> getIPs(String subnet,
+      boolean returnSubinterfaces) {
+    List<InetAddress> addrs = new ArrayList<InetAddress>();
+    SubnetInfo subnetInfo = new SubnetUtils(subnet).getInfo();
+    Enumeration<NetworkInterface> nifs;
+
+    try {
+      nifs = NetworkInterface.getNetworkInterfaces();
+    } catch (SocketException e) {
+      LOG.error("Unable to get host interfaces", e);
+      return addrs;
+    }
+
+    while (nifs.hasMoreElements()) {
+      NetworkInterface nif = nifs.nextElement();
+      // NB: adding addresses even if the nif is not up
+      addMatchingAddrs(nif, subnetInfo, addrs);
+
+      if (!returnSubinterfaces) {
+        continue;
+      }
+      Enumeration<NetworkInterface> subNifs = nif.getSubInterfaces();
+      while (subNifs.hasMoreElements()) {
+        addMatchingAddrs(subNifs.nextElement(), subnetInfo, addrs);
+      }
+    }
+    return addrs;
   }
 }

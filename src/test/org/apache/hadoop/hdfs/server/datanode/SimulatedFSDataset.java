@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hdfs.server.datanode;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -31,9 +32,11 @@ import javax.management.StandardMBean;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.hdfs.protocol.BlockLocalPathInfo;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.datanode.metrics.FSDatasetMBean;
-import org.apache.hadoop.metrics.util.MBeanUtil;
+import org.apache.hadoop.hdfs.server.protocol.BlockRecoveryInfo;
+import org.apache.hadoop.metrics2.util.MBeans;
 import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.DiskChecker.DiskErrorException;
 
@@ -66,6 +69,7 @@ public class SimulatedFSDataset  implements FSConstants, FSDatasetInterface, Con
   Configuration conf = null;
   
   static byte[] nullCrcFileData;
+
   {
     DataChecksum checksum = DataChecksum.newDataChecksum( DataChecksum.
                               CHECKSUM_NULL, 16*1024 );
@@ -265,7 +269,18 @@ public class SimulatedFSDataset  implements FSConstants, FSDatasetInterface, Con
     }
   }
 
-  public synchronized void finalizeBlock(Block b) throws IOException {
+  @Override
+  public void finalizeBlock(Block b) throws IOException {
+    finalizeBlockInternal(b, false);
+  }
+
+  @Override
+  public void finalizeBlockIfNeeded(Block b) throws IOException {
+    finalizeBlockInternal(b, true);    
+  }
+
+  private synchronized void finalizeBlockInternal(Block b, boolean refinalizeOk) 
+    throws IOException {
     BInfo binfo = blockMap.get(b);
     if (binfo == null) {
       throw new IOException("Finalizing a non existing block " + b);
@@ -293,6 +308,21 @@ public class SimulatedFSDataset  implements FSConstants, FSDatasetInterface, Con
     }
     return blockTable;
   }
+  
+  @Override
+  public void requestAsyncBlockReport() {
+  }
+
+  @Override
+  public boolean isAsyncBlockReportReady() {
+    return true;
+  }
+
+  @Override
+  public Block[] retrieveAsyncBlockReport() {
+    return getBlockReport();
+  }
+
 
   public long getCapacity() throws IOException {
     return storage.getCapacity();
@@ -312,6 +342,16 @@ public class SimulatedFSDataset  implements FSConstants, FSDatasetInterface, Con
       throw new IOException("Finalizing a non existing block " + b);
     }
     return binfo.getlength();
+  }
+
+  @Override
+  public long getVisibleLength(Block b) throws IOException {
+    return getLength(b);
+  }
+
+  @Override
+  public void setVisibleLength(Block b, long length) throws IOException {
+    //no-op
   }
 
   /** {@inheritDoc} */
@@ -381,7 +421,8 @@ public class SimulatedFSDataset  implements FSConstants, FSDatasetInterface, Con
   }
 
   public synchronized BlockWriteStreams writeToBlock(Block b, 
-                                            boolean isRecovery)
+                                            boolean isRecovery,
+                                            boolean isReplicationRequest)
                                             throws IOException {
     if (isValidBlock(b)) {
           throw new BlockAlreadyExistsException("Block " + b + 
@@ -638,7 +679,7 @@ public class SimulatedFSDataset  implements FSConstants, FSDatasetInterface, Con
 
     try {
       bean = new StandardMBean(this,FSDatasetMBean.class);
-      mbeanName = MBeanUtil.registerMBean("DataNode",
+      mbeanName = MBeans.register("DataNode",
           "FSDatasetState-" + storageId, bean);
     } catch (NotCompliantMBeanException e) {
       e.printStackTrace();
@@ -649,10 +690,31 @@ public class SimulatedFSDataset  implements FSConstants, FSDatasetInterface, Con
 
   public void shutdown() {
     if (mbeanName != null)
-      MBeanUtil.unregisterMBean(mbeanName);
+      MBeans.unregister(mbeanName);
   }
 
   public String getStorageInfo() {
     return "Simulated FSDataset-" + storageId;
+  }
+  
+  public boolean hasEnoughResource() {
+    return true;
+  }
+
+  @Override
+  public Block[] getBlocksBeingWrittenReport() {
+    return new Block[0];
+  }
+
+  @Override
+  public BlockRecoveryInfo startBlockRecovery(long blockId)
+      throws IOException {
+    Block stored = getStoredBlock(blockId);
+    return new BlockRecoveryInfo(stored, false);
+  }
+
+  @Override
+  public BlockLocalPathInfo getBlockLocalPathInfo(Block blk) throws IOException {
+    throw new IOException("getBlockLocalPathInfo not supported.");
   }
 }

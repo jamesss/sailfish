@@ -20,6 +20,8 @@ package org.apache.hadoop.io;
 
 import java.io.*;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 
 import org.apache.commons.logging.Log;
 
@@ -41,17 +43,8 @@ public class IOUtils {
   public static void copyBytes(InputStream in, OutputStream out, int buffSize, boolean close) 
     throws IOException {
 
-    PrintStream ps = out instanceof PrintStream ? (PrintStream)out : null;
-    byte buf[] = new byte[buffSize];
     try {
-      int bytesRead = in.read(buf);
-      while (bytesRead >= 0) {
-        out.write(buf, 0, bytesRead);
-        if ((ps != null) && ps.checkError()) {
-          throw new IOException("Unable to write to output stream.");
-        }
-        bytesRead = in.read(buf);
-      }
+      copyBytes(in, out, buffSize);
     } finally {
       if(close) {
         out.close();
@@ -60,6 +53,28 @@ public class IOUtils {
     }
   }
   
+  /**
+   * Copies from one stream to another.
+   * 
+   * @param in InputStrem to read from
+   * @param out OutputStream to write to
+   * @param buffSize the size of the buffer 
+   */
+  public static void copyBytes(InputStream in, OutputStream out, int buffSize) 
+    throws IOException {
+
+    PrintStream ps = out instanceof PrintStream ? (PrintStream)out : null;
+    byte buf[] = new byte[buffSize];
+    int bytesRead = in.read(buf);
+    while (bytesRead >= 0) {
+      out.write(buf, 0, bytesRead);
+      if ((ps != null) && ps.checkError()) {
+        throw new IOException("Unable to write to output stream.");
+      }
+      bytesRead = in.read(buf);
+    }
+  }
+
   /**
    * Copies from one stream to another. <strong>closes the input and output streams 
    * at the end</strong>.
@@ -85,6 +100,44 @@ public class IOUtils {
     copyBytes(in, out, conf.getInt("io.file.buffer.size", 4096),  close);
   }
   
+  /**
+   * Copies the specified length of bytes from in to out.
+   *
+   * @param in InputStream to read from
+   * @param out OutputStream to write to
+   * @param length number of bytes to copy
+   * @param bufferSize the size of the buffer 
+   * @param close whether to close the streams
+   * @throws IOException if bytes can not be read or written
+   */
+  public static void copyBytes(InputStream in, OutputStream out,
+      final long length, final int bufferSize, final boolean close
+      ) throws IOException {
+    final byte buf[] = new byte[bufferSize];
+    try {
+      int n = 0;
+      for(long remaining = length; remaining > 0 && n != -1; remaining -= n) {
+        final int toRead = remaining < buf.length? (int)remaining : buf.length;
+        n = in.read(buf, 0, toRead);
+        if (n > 0) {
+          out.write(buf, 0, n);
+        }
+      }
+
+      if (close) {
+        out.close();
+        out = null;
+        in.close();
+        in = null;
+      }
+    } finally {
+      if (close) {
+        closeStream(out);
+        closeStream(in);
+      }
+    }
+  }
+
   /** Reads len bytes in a loop.
    * @param in The InputStream to read from
    * @param buf The buffer to fill
@@ -98,6 +151,28 @@ public class IOUtils {
     int toRead = len;
     while ( toRead > 0 ) {
       int ret = in.read( buf, off, toRead );
+      if ( ret < 0 ) {
+        throw new IOException( "Premature EOF from inputStream");
+      }
+      toRead -= ret;
+      off += ret;
+    }
+  }
+
+  /** Reads len bytes in a loop using the channel of the stream
+   * @param fileChannel a FileChannel to read len bytes into buf
+   * @param buf The buffer to fill
+   * @param off offset from the buffer
+   * @param len the length of bytes to read
+   * @throws IOException if it could not read requested number of bytes 
+   * for any reason (including EOF)
+   */
+  public static void readFileChannelFully( FileChannel fileChannel, byte buf[],
+      int off, int len ) throws IOException {
+    int toRead = len;
+    ByteBuffer byteBuffer = ByteBuffer.wrap(buf, off, len);
+    while ( toRead > 0 ) {
+      int ret = fileChannel.read(byteBuffer);
       if ( ret < 0 ) {
         throw new IOException( "Premeture EOF from inputStream");
       }
@@ -116,7 +191,7 @@ public class IOUtils {
     while ( len > 0 ) {
       long ret = in.skip( len );
       if ( ret < 0 ) {
-        throw new IOException( "Premeture EOF from inputStream");
+        throw new IOException( "Premature EOF from inputStream");
       }
       len -= ret;
     }

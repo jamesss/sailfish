@@ -41,6 +41,7 @@ import org.apache.hadoop.mapred.lib.IdentityReducer;
 import org.apache.hadoop.mapred.lib.HashPartitioner;
 import org.apache.hadoop.mapred.lib.KeyFieldBasedComparator;
 import org.apache.hadoop.mapred.lib.KeyFieldBasedPartitioner;
+import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.Tool;
 
@@ -99,9 +100,7 @@ import org.apache.hadoop.util.Tool;
  * @see ClusterStatus
  * @see Tool
  * @see DistributedCache
- * @deprecated Use {@link Configuration} instead
  */
-@Deprecated
 public class JobConf extends Configuration {
   
   private static final Log LOG = LogFactory.getLog(JobConf.class);
@@ -145,19 +144,177 @@ public class JobConf extends Configuration {
    * indicates that the options are turned off.
    */
   public static final long DISABLED_MEMORY_LIMIT = -1L;
-  
+
+  /**
+   * Property name for the configuration property mapred.local.dir
+   */
+  public static final String MAPRED_LOCAL_DIR_PROPERTY = "mapred.local.dir";
+
   /**
    * Name of the queue to which jobs will be submitted, if no queue
    * name is mentioned.
    */
   public static final String DEFAULT_QUEUE_NAME = "default";
-
-  static final String MAPRED_JOB_MAP_MEMORY_MB_PROPERTY =
+  
+  public static final String MAPRED_JOB_MAP_MEMORY_MB_PROPERTY =
       "mapred.job.map.memory.mb";
 
-  static final String MAPRED_JOB_REDUCE_MEMORY_MB_PROPERTY =
+  public static final String MAPRED_JOB_REDUCE_MEMORY_MB_PROPERTY =
       "mapred.job.reduce.memory.mb";
 
+  static final String MR_ACLS_ENABLED = "mapred.acls.enabled";
+
+  static final String MR_ADMINS = "mapreduce.cluster.administrators";
+
+  /**
+   * Configuration key to set the java command line options for the child
+   * map and reduce tasks.
+   * 
+   * Java opts for the task tracker child processes.
+   * The following symbol, if present, will be interpolated: @taskid@. 
+   * It is replaced by current TaskID. Any other occurrences of '@' will go 
+   * unchanged.
+   * For example, to enable verbose gc logging to a file named for the taskid in
+   * /tmp and to set the heap maximum to be a gigabyte, pass a 'value' of:
+   *          -Xmx1024m -verbose:gc -Xloggc:/tmp/@taskid@.gc
+   * 
+   * The configuration variable {@link #MAPRED_TASK_ULIMIT} can be used to 
+   * control the maximum virtual memory of the child processes.
+   * 
+   * The configuration variable {@link #MAPRED_TASK_ENV} can be used to pass 
+   * other environment variables to the child processes.
+   * 
+   * @deprecated Use {@link #MAPRED_MAP_TASK_JAVA_OPTS} or 
+   *                 {@link #MAPRED_REDUCE_TASK_JAVA_OPTS}
+   */
+  @Deprecated
+  public static final String MAPRED_TASK_JAVA_OPTS = "mapred.child.java.opts";
+  
+  /**
+   * Configuration key to set the java command line options for the map tasks.
+   * 
+   * Java opts for the task tracker child map processes.
+   * The following symbol, if present, will be interpolated: @taskid@. 
+   * It is replaced by current TaskID. Any other occurrences of '@' will go 
+   * unchanged.
+   * For example, to enable verbose gc logging to a file named for the taskid in
+   * /tmp and to set the heap maximum to be a gigabyte, pass a 'value' of:
+   *          -Xmx1024m -verbose:gc -Xloggc:/tmp/@taskid@.gc
+   * 
+   * The configuration variable {@link #MAPRED_MAP_TASK_ULIMIT} can be used to 
+   * control the maximum virtual memory of the map processes.
+   * 
+   * The configuration variable {@link #MAPRED_MAP_TASK_ENV} can be used to pass 
+   * other environment variables to the map processes.
+   */
+  public static final String MAPRED_MAP_TASK_JAVA_OPTS = 
+    "mapred.map.child.java.opts";
+  
+  /**
+   * Configuration key to set the java command line options for the reduce tasks.
+   * 
+   * Java opts for the task tracker child reduce processes.
+   * The following symbol, if present, will be interpolated: @taskid@. 
+   * It is replaced by current TaskID. Any other occurrences of '@' will go 
+   * unchanged.
+   * For example, to enable verbose gc logging to a file named for the taskid in
+   * /tmp and to set the heap maximum to be a gigabyte, pass a 'value' of:
+   *          -Xmx1024m -verbose:gc -Xloggc:/tmp/@taskid@.gc
+   * 
+   * The configuration variable {@link #MAPRED_REDUCE_TASK_ULIMIT} can be used  
+   * to control the maximum virtual memory of the reduce processes.
+   * 
+   * The configuration variable {@link #MAPRED_REDUCE_TASK_ENV} can be used to 
+   * pass process environment variables to the reduce processes.
+   */
+  public static final String MAPRED_REDUCE_TASK_JAVA_OPTS = 
+    "mapred.reduce.child.java.opts";
+  
+  public static final String DEFAULT_MAPRED_TASK_JAVA_OPTS = "-Xmx200m";
+  
+  /**
+   * Configuration key to set the maximum virutal memory available to the child
+   * map and reduce tasks (in kilo-bytes).
+   * 
+   * Note: This must be greater than or equal to the -Xmx passed to the JavaVM
+   *       via {@link #MAPRED_TASK_JAVA_OPTS}, else the VM might not start.
+   * 
+   * @deprecated Use {@link #MAPRED_MAP_TASK_ULIMIT} or 
+   *                 {@link #MAPRED_REDUCE_TASK_ULIMIT}
+   */
+  @Deprecated
+  public static final String MAPRED_TASK_ULIMIT = "mapred.child.ulimit";
+
+  /**
+   * Configuration key to set the maximum virutal memory available to the
+   * map tasks (in kilo-bytes).
+   * 
+   * Note: This must be greater than or equal to the -Xmx passed to the JavaVM
+   *       via {@link #MAPRED_MAP_TASK_JAVA_OPTS}, else the VM might not start.
+   */
+  public static final String MAPRED_MAP_TASK_ULIMIT = "mapred.map.child.ulimit";
+  
+  /**
+   * Configuration key to set the maximum virutal memory available to the
+   * reduce tasks (in kilo-bytes).
+   * 
+   * Note: This must be greater than or equal to the -Xmx passed to the JavaVM
+   *       via {@link #MAPRED_REDUCE_TASK_JAVA_OPTS}, else the VM might not start.
+   */
+  public static final String MAPRED_REDUCE_TASK_ULIMIT =
+    "mapred.reduce.child.ulimit";
+
+  /**
+   * Configuration key to set the environment of the child map/reduce tasks.
+   * 
+   * The format of the value is <code>k1=v1,k2=v2</code>. Further it can 
+   * reference existing environment variables via <code>$key</code>.
+   * 
+   * Example:
+   * <ul>
+   *   <li> A=foo - This will set the env variable A to foo. </li>
+   *   <li> B=$X:c This is inherit tasktracker's X env variable. </li>
+   * </ul>
+   * 
+   * @deprecated Use {@link #MAPRED_MAP_TASK_ENV} or 
+   *                 {@link #MAPRED_REDUCE_TASK_ENV}
+   */
+  @Deprecated
+  public static final String MAPRED_TASK_ENV = "mapred.child.env";
+
+  /**
+   * Configuration key to set the maximum virutal memory available to the
+   * map tasks.
+   * 
+   * The format of the value is <code>k1=v1,k2=v2</code>. Further it can 
+   * reference existing environment variables via <code>$key</code>.
+   * 
+   * Example:
+   * <ul>
+   *   <li> A=foo - This will set the env variable A to foo. </li>
+   *   <li> B=$X:c This is inherit tasktracker's X env variable. </li>
+   * </ul>
+   */
+  public static final String MAPRED_MAP_TASK_ENV = "mapred.map.child.env";
+  
+  /**
+   * Configuration key to set the maximum virutal memory available to the
+   * reduce tasks.
+   * 
+   * The format of the value is <code>k1=v1,k2=v2</code>. Further it can 
+   * reference existing environment variables via <code>$key</code>.
+   * 
+   * Example:
+   * <ul>
+   *   <li> A=foo - This will set the env variable A to foo. </li>
+   *   <li> B=$X:c This is inherit tasktracker's X env variable. </li>
+   * </ul>
+   */
+  public static final String MAPRED_REDUCE_TASK_ENV =
+    "mapred.reduce.child.env";
+
+  private Credentials credentials = new Credentials();
+  
   /**
    * Construct a map/reduce job configuration.
    */
@@ -182,6 +339,12 @@ public class JobConf extends Configuration {
    */
   public JobConf(Configuration conf) {
     super(conf);
+    
+    if (conf instanceof JobConf) {
+      JobConf that = (JobConf)conf;
+      credentials = that.credentials;
+    }
+    
     checkAndWarnDeprecation();
   }
 
@@ -229,6 +392,18 @@ public class JobConf extends Configuration {
   }
 
   /**
+   * Get credentials for the job.
+   * @return credentials for the job
+   */
+  public Credentials getCredentials() {
+    return credentials;
+  }
+  
+  void setCredentials(Credentials credentials) {
+    this.credentials = credentials;
+  }
+  
+  /**
    * Get the user jar for the map-reduce job.
    * 
    * @return the user jar for the map-reduce job.
@@ -255,7 +430,7 @@ public class JobConf extends Configuration {
   }
 
   public String[] getLocalDirs() throws IOException {
-    return getStrings("mapred.local.dir");
+    return getStrings(MAPRED_LOCAL_DIR_PROPERTY);
   }
 
   public void deleteLocalFiles() throws IOException {
@@ -277,7 +452,7 @@ public class JobConf extends Configuration {
    * local directories.
    */
   public Path getLocalPath(String pathString) throws IOException {
-    return getLocalPath("mapred.local.dir", pathString);
+    return getLocalPath(MAPRED_LOCAL_DIR_PROPERTY, pathString);
   }
 
   /**
@@ -1237,6 +1412,46 @@ public class JobConf extends Configuration {
   }
 
   /**
+   * Set {@link JobSubmitHostName} for this job.
+   * 
+   * @param prio the {@link JobSubmitHostName} for this job.
+   */
+  void setJobSubmitHostName(String hostname) {
+    set("mapreduce.job.submithost", hostname);
+  }
+  
+  /**
+   * Get the {@link JobSubmitHostName} for this job.
+   * 
+   * @return the {@link JobSubmitHostName} for this job.
+   */
+  String getJobSubmitHostName() {
+    String hostname = get("mapreduce.job.submithost");
+    
+    return hostname;
+  }
+
+  /**
+   * Set {@link JobSubmitHostAddress} for this job.
+   * 
+   * @param prio the {@link JobSubmitHostAddress} for this job.
+   */
+  void setJobSubmitHostAddress(String hostadd) {
+    set("mapreduce.job.submithostaddress", hostadd);
+  }
+  
+  /**
+   * Get the {@link JobSubmitHostAddress} for this job.
+   * 
+   * @return the {@link JobSubmitHostAddress} for this job.
+   */
+  String getJobSubmitHostAddress() {
+    String hostadd = get("mapreduce.job.submithostaddress");
+    
+    return hostadd;
+  }
+
+  /**
    * Get whether the task profiling is enabled.
    * @return true if some tasks will be profiled
    */
@@ -1415,7 +1630,7 @@ public class JobConf extends Configuration {
    * <p>
    * When a job starts, a shared directory is created at location
    * <code>
-   * ${mapred.local.dir}/taskTracker/jobcache/$jobid/work/ </code>.
+   * ${mapred.local.dir}/taskTracker/$user/jobcache/$jobid/work/ </code>.
    * This directory is exposed to the users through 
    * <code>job.local.dir </code>.
    * So, the tasks can use this space 
@@ -1425,7 +1640,7 @@ public class JobConf extends Configuration {
    * @return The localized job specific shared directory
    */
   public String getJobLocalDir() {
-    return get("job.local.dir");
+    return get(TaskTracker.JOB_LOCAL_DIR);
   }
 
   /**
@@ -1528,6 +1743,39 @@ public class JobConf extends Configuration {
     return val;
   }
 
+  /**
+   * Compute the number of slots required to run a single map task-attempt
+   * of this job.
+   * @param slotSizePerMap cluster-wide value of the amount of memory required
+   *                       to run a map-task
+   * @return the number of slots required to run a single map task-attempt
+   *                1 if memory parameters are disabled.
+   */
+  int computeNumSlotsPerMap(long slotSizePerMap) {
+    if ((slotSizePerMap==DISABLED_MEMORY_LIMIT) ||
+        (getMemoryForMapTask()==DISABLED_MEMORY_LIMIT)) {
+      return 1;
+    }
+    return (int)(Math.ceil((float)getMemoryForMapTask() / (float)slotSizePerMap));
+  }
+  
+  /**
+   * Compute the number of slots required to run a single reduce task-attempt
+   * of this job.
+   * @param slotSizePerReduce cluster-wide value of the amount of memory 
+   *                          required to run a reduce-task
+   * @return the number of slots required to run a single reduce task-attempt
+   *                1 if memory parameters are disabled.
+   */
+  int computeNumSlotsPerReduce(long slotSizePerReduce) {
+    if ((slotSizePerReduce==DISABLED_MEMORY_LIMIT) ||
+        (getMemoryForReduceTask()==DISABLED_MEMORY_LIMIT)) {
+      return 1;
+    }
+    return 
+    (int)(Math.ceil((float)getMemoryForReduceTask() / (float)slotSizePerReduce));
+  }
+  
   /** 
    * Find a jar that contains a class of the same name, if any.
    * It will return a jar file, even if that is not the first thing

@@ -22,17 +22,25 @@ package org.apache.hadoop.metrics;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Properties;
-import org.apache.hadoop.metrics.spi.AbstractMetricsContext;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.metrics.spi.NullContext;
 
 /**
  * Factory class for creating MetricsContext objects.  To obtain an instance
  * of this class, use the static <code>getFactory()</code> method.
+ * @deprecated in favor of <code>org.apache.hadoop.metrics2</code> usage.
  */
+@Deprecated
+@InterfaceAudience.LimitedPrivate({"HDFS", "MapReduce"})
+@InterfaceStability.Evolving
 public class ContextFactory {
     
   private static final String PROPERTIES_FILE = 
@@ -142,6 +150,14 @@ public class ContextFactory {
            IllegalAccessException {
     return getContext(contextName, contextName);
   }
+  
+  /** 
+   * Returns all MetricsContexts built by this factory.
+   */
+  public synchronized Collection<MetricsContext> getAllContexts() {
+    // Make a copy to avoid race conditions with creating new contexts.
+    return new ArrayList<MetricsContext>(contextMap.values());
+  }
     
   /**
    * Returns a "null" context - one which does nothing.
@@ -178,14 +194,18 @@ public class ContextFactory {
   private void setAttributes() throws IOException {
     InputStream is = getClass().getResourceAsStream(PROPERTIES_FILE);
     if (is != null) {
-      Properties properties = new Properties();
-      properties.load(is);
-      //for (Object propertyNameObj : properties.keySet()) {
-      Iterator it = properties.keySet().iterator();
-      while (it.hasNext()) {
-        String propertyName = (String) it.next();
-        String propertyValue = properties.getProperty(propertyName);
-        setAttribute(propertyName, propertyValue);
+      try {
+        Properties properties = new Properties();
+        properties.load(is);
+        //for (Object propertyNameObj : properties.keySet()) {
+        Iterator it = properties.keySet().iterator();
+        while (it.hasNext()) {
+          String propertyName = (String) it.next();
+          String propertyValue = properties.getProperty(propertyName);
+          setAttribute(propertyName, propertyValue);
+        }
+      } finally {
+        is.close();
       }
     }
   }

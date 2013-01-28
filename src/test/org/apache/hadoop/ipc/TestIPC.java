@@ -29,10 +29,19 @@ import java.util.Random;
 import java.io.DataInput;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+
+import javax.net.SocketFactory;
 
 import junit.framework.TestCase;
 
 import org.apache.hadoop.conf.Configuration;
+
+import static org.mockito.Mockito.*;
+import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 
 /** Unit tests for IPC. */
 public class TestIPC extends TestCase {
@@ -41,7 +50,8 @@ public class TestIPC extends TestCase {
   
   final private static Configuration conf = new Configuration();
   final static private int PING_INTERVAL = 1000;
-  
+  final static private int MIN_SLEEP_TIME = 1000;
+ 
   static {
     Client.setPingInterval(conf, PING_INTERVAL);
   }
@@ -64,8 +74,9 @@ public class TestIPC extends TestCase {
     public Writable call(Class<?> protocol, Writable param, long receiveTime)
         throws IOException {
       if (sleep) {
+        // sleep a bit
         try {
-          Thread.sleep(RANDOM.nextInt(2*PING_INTERVAL));      // sleep a bit
+          Thread.sleep(RANDOM.nextInt(PING_INTERVAL) + MIN_SLEEP_TIME);
         } catch (InterruptedException e) {}
       }
       return param;                               // echo param as result
@@ -89,7 +100,7 @@ public class TestIPC extends TestCase {
         try {
           LongWritable param = new LongWritable(RANDOM.nextLong());
           LongWritable value =
-            (LongWritable)client.call(param, server, null, null);
+            (LongWritable)client.call(param, server, null, null, 0, conf);
           if (!param.equals(value)) {
             LOG.fatal("Call failed!");
             failed = true;
@@ -122,7 +133,7 @@ public class TestIPC extends TestCase {
           Writable[] params = new Writable[addresses.length];
           for (int j = 0; j < addresses.length; j++)
             params[j] = new LongWritable(RANDOM.nextLong());
-          Writable[] values = client.call(params, addresses, null, null);
+          Writable[] values = client.call(params, addresses, null, null, conf);
           for (int j = 0; j < addresses.length; j++) {
             if (!params[j].equals(values[j])) {
               LOG.fatal("Call failed!");
@@ -139,7 +150,7 @@ public class TestIPC extends TestCase {
   }
 
   public void testSerial() throws Exception {
-    testSerial(3, false, 2, 5, 100);
+    testSerial(3, false, 2, 5, 10);
   }
 
   public void testSerial(int handlerCount, boolean handlerSleep, 
@@ -217,7 +228,7 @@ public class TestIPC extends TestCase {
     InetSocketAddress address = new InetSocketAddress("127.0.0.1", 10);
     try {
       client.call(new LongWritable(RANDOM.nextLong()),
-              address, null, null);
+              address, null, null, 0, conf);
       fail("Expected an exception to have been thrown");
     } catch (IOException e) {
       String message = e.getMessage();
@@ -230,6 +241,73 @@ public class TestIPC extends TestCase {
       assertTrue("Did not find " + causeText + " in " + message,
               message.contains(causeText));
     }
+  }
+
+  /**
+  * Test that, if a RuntimeException is thrown after creating a socket
+  * but before successfully connecting to the IPC server, that the
+  * failure is handled properly. This is a regression test for
+  * HADOOP-7428 (HADOOP-8294).
+  */
+  public void testRTEDuringConnectionSetup() throws Exception {
+    // Set up a socket factory which returns sockets which
+    // throw an RTE when setSoTimeout is called.
+    SocketFactory spyFactory = spy(NetUtils.getDefaultSocketFactory(conf));
+    Mockito.doAnswer(new Answer<Socket>() {
+      @Override
+      public Socket answer(InvocationOnMock invocation) throws Throwable {
+        Socket s = spy((Socket)invocation.callRealMethod());
+        doThrow(new RuntimeException("Injected fault")).when(s)
+          .setSoTimeout(anyInt());
+        return s;
+      }
+    }).when(spyFactory).createSocket();
+ 
+    Server server = new TestServer(1, true);
+    server.start();
+    try {
+      // Call should fail due to injected exception.
+      InetSocketAddress address = NetUtils.getConnectAddress(server);
+      Client client = new Client(LongWritable.class, conf, spyFactory);
+      try {
+        client.call(new LongWritable(RANDOM.nextLong()),
+                address, null, null, 0, conf);
+        fail("Expected an exception to have been thrown");
+      } catch (Exception e) {
+        LOG.info("caught expected exception", e);
+        assertTrue(StringUtils.stringifyException(e).contains(
+            "Injected fault"));
+      }
+      // Resetting to the normal socket behavior should succeed
+      // (i.e. it should not have cached a half-constructed connection)
+  
+      Mockito.reset(spyFactory);
+      client.call(new LongWritable(RANDOM.nextLong()),
+          address, null, null, 0, conf);
+    } finally {
+      server.stop();
+    }
+  }
+
+  public void testIpcTimeout() throws Exception {
+    // start server
+    Server server = new TestServer(1, true);
+    InetSocketAddress addr = NetUtils.getConnectAddress(server);
+    server.start();
+
+    // start client
+    Client client = new Client(LongWritable.class, conf);
+    // set timeout to be less than MIN_SLEEP_TIME
+    try {
+      client.call(new LongWritable(RANDOM.nextLong()),
+              addr, null, null, MIN_SLEEP_TIME/2);
+      fail("Expected an exception to have been thrown");
+    } catch (SocketTimeoutException e) {
+     LOG.info("Get a SocketTimeoutException ", e);
+    }
+    // set timeout to be bigger than 3*ping interval
+    client.call(new LongWritable(RANDOM.nextLong()),
+        addr, null, null, 3*PING_INTERVAL+MIN_SLEEP_TIME);
   }
 
   private static class LongErrorWritable extends LongWritable {
@@ -258,7 +336,7 @@ public class TestIPC extends TestCase {
     Client client = new Client(LongErrorWritable.class, conf);
     try {
       client.call(new LongErrorWritable(RANDOM.nextLong()),
-          addr, null, null);
+          addr, null, null, 0, conf);
       fail("Expected an exception to have been thrown");
     } catch (IOException e) {
       // check error

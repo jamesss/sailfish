@@ -21,17 +21,17 @@ import java.io.*;
 import java.util.*;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.permission.*;
-import org.apache.hadoop.metrics.MetricsRecord;
-import org.apache.hadoop.metrics.MetricsUtil;
-import org.apache.hadoop.metrics.MetricsContext;
+import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.DirectoryListing;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.StartupOption;
+import org.apache.hadoop.hdfs.util.ByteArray;
 import org.apache.hadoop.hdfs.server.namenode.BlocksMap.BlockInfo;
 
 /*************************************************
@@ -49,8 +49,13 @@ class FSDirectory implements FSConstants, Closeable {
   final INodeDirectoryWithQuota rootDir;
   FSImage fsImage;  
   private boolean ready = false;
-  // Metrics record
-  private MetricsRecord directoryMetrics = null;
+  private final int lsLimit;  // max list limit
+
+  /**
+   * Caches frequently used file names used in {@link INode} to reuse 
+   * byte[] objects and reduce heap usage.
+   */
+  private final NameCache<ByteArray> nameCache;
 
   /** Access an existing dfs name directory. */
   FSDirectory(FSNamesystem ns, Configuration conf) {
@@ -64,14 +69,22 @@ class FSDirectory implements FSConstants, Closeable {
         ns.createFsOwnerPermissions(new FsPermission((short)0755)),
         Integer.MAX_VALUE, -1);
     this.fsImage = fsImage;
+    fsImage.setRestoreRemovedDirs(conf.getBoolean(
+        DFSConfigKeys.DFS_NAMENODE_NAME_DIR_RESTORE_KEY,
+        DFSConfigKeys.DFS_NAMENODE_NAME_DIR_RESTORE_DEFAULT));
     namesystem = ns;
-    initialize(conf);
-  }
+    int configuredLimit = conf.getInt(
+        DFSConfigKeys.DFS_LIST_LIMIT, DFSConfigKeys.DFS_LIST_LIMIT_DEFAULT);
+    this.lsLimit = configuredLimit>0 ? 
+        configuredLimit : DFSConfigKeys.DFS_LIST_LIMIT_DEFAULT;
     
-  private void initialize(Configuration conf) {
-    MetricsContext metricsContext = MetricsUtil.getContext("dfs");
-    directoryMetrics = MetricsUtil.createRecord(metricsContext, "FSDirectory");
-    directoryMetrics.setTag("sessionId", conf.get("session.id"));
+    int threshold = conf.getInt(
+        DFSConfigKeys.DFS_NAMENODE_NAME_CACHE_THRESHOLD_KEY,
+        DFSConfigKeys.DFS_NAMENODE_NAME_CACHE_THRESHOLD_DEFAULT);
+    NameNode.LOG.info("Caching file names occuring more than " + threshold
+        + " times ");
+    nameCache = new NameCache<ByteArray>(threshold);
+
   }
 
   void loadFSImage(Collection<File> dataDirs,
@@ -85,7 +98,7 @@ class FSDirectory implements FSConstants, Closeable {
     }
     try {
       if (fsImage.recoverTransitionRead(dataDirs, editsDirs, startOpt)) {
-        fsImage.saveFSImage();
+        fsImage.saveNamespace(true);
       }
       FSEditLog editLog = fsImage.getEditLog();
       assert editLog != null : "editLog must be initialized";
@@ -98,13 +111,14 @@ class FSDirectory implements FSConstants, Closeable {
     }
     synchronized (this) {
       this.ready = true;
+      this.nameCache.initialized();
       this.notifyAll();
     }
   }
 
   private void incrDeletedFileCount(int count) {
-    directoryMetrics.incrMetric("files_deleted", count);
-    directoryMetrics.update();
+    if (namesystem != null)
+      NameNode.getNameNodeMetrics().incrFilesDeleted(count);
   }
     
   /**
@@ -235,6 +249,7 @@ class FSDirectory implements FSConstants, Closeable {
     synchronized (rootDir) {
       try {
         newParent = rootDir.addToParent(src, newNode, parentINode, false);
+        cacheName(newNode);
       } catch (FileNotFoundException e) {
         return null;
       }
@@ -328,7 +343,12 @@ class FSDirectory implements FSConstants, Closeable {
       NameNode.stateChangeLog.debug("DIR* FSDirectory.addFile: "
                                     +path+" with "+block
                                     +" block is added to the file system");
+      // update space consumed
+      INode[] pathINodes = getExistingPathINodes(path);
+      updateCount(pathINodes, pathINodes.length-1, 0,
+          -fileNode.getPreferredBlockSize()*fileNode.getReplication(), true);
     }
+
     return true;
   }
 
@@ -567,19 +587,29 @@ class FSDirectory implements FSConstants, Closeable {
   }
     
   /**
-   * Remove the file from management, return blocks
+   * Delete the target directory and collect the blocks under it
+   * 
+   * @param src
+   *          Path of a directory to delete
+   * @param collectedBlocks
+   *          Blocks under the deleted directory
+   * @return true on successful deletion; else false
    */
-  INode delete(String src) {
+  boolean delete(String src, List<Block>collectedBlocks) {
     if (NameNode.stateChangeLog.isDebugEnabled()) {
-      NameNode.stateChangeLog.debug("DIR* FSDirectory.delete: "+src);
+      NameNode.stateChangeLog.debug("DIR* FSDirectory.delete: " + src);
     }
     waitForReady();
     long now = FSNamesystem.now();
-    INode deletedNode = unprotectedDelete(src, now);
-    if (deletedNode != null) {
-      fsImage.getEditLog().logDelete(src, now);
+    int filesRemoved = unprotectedDelete(src, collectedBlocks, now);
+    if (filesRemoved <= 0) {
+      return false;
     }
-    return deletedNode;
+    incrDeletedFileCount(filesRemoved);
+    // Blocks will be deleted later by the caller of this method
+    FSNamesystem.getFSNamesystem().removePathAndBlocks(src, null);
+    fsImage.getEditLog().logDelete(src, now);
+    return true;
   }
   
   /** Return if a directory is empty or not **/
@@ -599,14 +629,36 @@ class FSDirectory implements FSConstants, Closeable {
   }
   
   /**
-   * Delete a path from the name space
-   * Update the count at each ancestor directory with quota
-   * @param src a string representation of a path to an inode
-   * @param modificationTime the time the inode is removed
-   * @param deletedBlocks the place holder for the blocks to be removed
-   * @return if the deletion succeeds
-   */ 
-  INode unprotectedDelete(String src, long modificationTime) {
+   * Delete a path from the name space Update the count at each ancestor
+   * directory with quota
+   * 
+   * @param src
+   *          a string representation of a path to an inode
+   * 
+   * @param mTime
+   *          the time the inode is removed
+   */
+  void unprotectedDelete(String src, long mTime) {
+    List<Block> collectedBlocks = new ArrayList<Block>();
+    int filesRemoved = unprotectedDelete(src, collectedBlocks, mTime);
+    if (filesRemoved > 0) {
+      namesystem.removePathAndBlocks(src, collectedBlocks);
+    }
+  }
+  
+  /**
+   * Delete a path from the name space Update the count at each ancestor
+   * directory with quota
+   * 
+   * @param src
+   *          a string representation of a path to an inode
+   * @param collectedBlocks
+   *          blocks collected from the deleted path
+   * @param mtime
+   *          the time the inode is removed
+   * @return the number of inodes deleted; 0 if no inodes are deleted.
+   */
+  int unprotectedDelete(String src, List<Block> collectedBlocks, long mtime) {
     src = normalizePath(src);
 
     synchronized (rootDir) {
@@ -616,53 +668,37 @@ class FSDirectory implements FSConstants, Closeable {
       if (targetNode == null) { // non-existent src
         NameNode.stateChangeLog.debug("DIR* FSDirectory.unprotectedDelete: "
             +"failed to remove "+src+" because it does not exist");
-        return null;
-      } else if (inodes.length == 1) { // src is the root
+        return 0;
+      } 
+      if (inodes.length == 1) { // src is the root
         NameNode.stateChangeLog.warn("DIR* FSDirectory.unprotectedDelete: " +
             "failed to remove " + src +
             " because the root is not allowed to be deleted");
-        return null;
-      } else {
-        try {
-          // Remove the node from the namespace
-          removeChild(inodes, inodes.length-1);
-          // set the parent's modification time
-          inodes[inodes.length-2].setModificationTime(modificationTime);
-          // GC all the blocks underneath the node.
-          ArrayList<Block> v = new ArrayList<Block>();
-          int filesRemoved = targetNode.collectSubtreeBlocksAndClear(v);
-          incrDeletedFileCount(filesRemoved);
-          namesystem.removePathAndBlocks(src, v);
-          if (NameNode.stateChangeLog.isDebugEnabled()) {
-            NameNode.stateChangeLog.debug("DIR* FSDirectory.unprotectedDelete: "
-              +src+" is removed");
-          }
-          return targetNode;
-        } catch (IOException e) {
-          NameNode.stateChangeLog.warn("DIR* FSDirectory.unprotectedDelete: " +
-              "failed to remove " + src + " because " + e.getMessage());
-          return null;
-        }
+        return 0;
+      } 
+      int pos = inodes.length - 1;
+      targetNode = removeChild(inodes, pos);
+      if (targetNode == null) {
+        return 0;
       }
+      // set the parent's modification time
+      inodes[pos - 1].setModificationTime(mtime);
+      int filesRemoved = targetNode
+          .collectSubtreeBlocksAndClear(collectedBlocks);
+      if (NameNode.stateChangeLog.isDebugEnabled()) {
+        NameNode.stateChangeLog.debug("DIR* FSDirectory.unprotectedDelete: "
+            + src + " is removed");
+      }
+      return filesRemoved;
     }
   }
 
   /**
    * Replaces the specified inode with the specified one.
    */
-  void replaceNode(String path, INodeFile oldnode, INodeFile newnode) 
-                                                   throws IOException {
-    replaceNode(path, oldnode, newnode, true);
-  }
-  
-  /**
-   * @see #replaceNode(String, INodeFile, INodeFile)
-   */
-  private void replaceNode(String path, INodeFile oldnode, INodeFile newnode,
-                           boolean updateDiskspace) throws IOException {    
+  void replaceNode(String path, INodeFile oldnode, INodeFile newnode)
+      throws IOException {
     synchronized (rootDir) {
-      long dsOld = oldnode.diskspaceConsumed();
-      
       //
       // Remove the node from the namespace 
       //
@@ -679,18 +715,6 @@ class FSDirectory implements FSConstants, Closeable {
       
       rootDir.addNode(path, newnode); 
 
-      //check if disk space needs to be updated.
-      long dsNew = 0;
-      if (updateDiskspace && (dsNew = newnode.diskspaceConsumed()) != dsOld) {
-        try {
-          updateSpaceConsumed(path, 0, dsNew-dsOld);
-        } catch (QuotaExceededException e) {
-          // undo
-          replaceNode(path, newnode, oldnode, false);
-          throw e;
-        }
-      }
-      
       int index = 0;
       for (Block b : newnode.getBlocks()) {
         BlockInfo info = namesystem.blocksMap.addINode(b, newnode);
@@ -701,31 +725,36 @@ class FSDirectory implements FSConstants, Closeable {
   }
 
   /**
-   * Get a listing of files given path 'src'
-   *
-   * This function is admittedly very inefficient right now.  We'll
-   * make it better later.
+   * Get a partial listing of the indicated directory
+   * 
+   * @param src the directory name
+   * @param startAfter the name to start listing after
+   * @return a partial listing starting after startAfter 
    */
-  FileStatus[] getListing(String src) {
+  DirectoryListing getListing(String src, byte[] startAfter) {
     String srcs = normalizePath(src);
 
     synchronized (rootDir) {
       INode targetNode = rootDir.getNode(srcs);
       if (targetNode == null)
         return null;
+      
       if (!targetNode.isDirectory()) {
-        return new FileStatus[]{createFileStatus(srcs, targetNode)};
+        return new DirectoryListing(new HdfsFileStatus[]{createFileStatus(
+            HdfsFileStatus.EMPTY_NAME, targetNode)}, 0);
       }
-      List<INode> contents = ((INodeDirectory)targetNode).getChildren();
-      FileStatus listing[] = new FileStatus[contents.size()];
-      if(! srcs.endsWith(Path.SEPARATOR))
-        srcs += Path.SEPARATOR;
-      int i = 0;
-      for (INode cur : contents) {
-        listing[i] = createFileStatus(srcs+cur.getLocalName(), cur);
-        i++;
+      INodeDirectory dirInode = (INodeDirectory)targetNode; 
+      List<INode> contents = dirInode.getChildren();
+      int startChild = dirInode.nextChild(startAfter);
+      int totalNumChildren = contents.size();
+      int numOfListing = Math.min(totalNumChildren-startChild, this.lsLimit);
+      HdfsFileStatus listing[] = new HdfsFileStatus[numOfListing];
+      for (int i=0; i<numOfListing; i++) {
+        INode cur = contents.get(startChild+i);
+        listing[i] = createFileStatus(cur.name, cur);
       }
-      return listing;
+      return new DirectoryListing(
+          listing, totalNumChildren-startChild-numOfListing);
     }
   }
 
@@ -734,7 +763,7 @@ class FSDirectory implements FSConstants, Closeable {
    * @return object containing information regarding the file
    *         or null if file not found
    */
-  FileStatus getFileInfo(String src) {
+  HdfsFileStatus getFileInfo(String src) {
     String srcs = normalizePath(src);
     synchronized (rootDir) {
       INode targetNode = rootDir.getNode(srcs);
@@ -742,7 +771,7 @@ class FSDirectory implements FSConstants, Closeable {
         return null;
       }
       else {
-        return createFileStatus(srcs, targetNode);
+        return createFileStatus(HdfsFileStatus.EMPTY_NAME, targetNode);
       }
     }
   }
@@ -893,6 +922,23 @@ class FSDirectory implements FSConstants, Closeable {
     return fullPathName.toString();
   }
   
+  /** Return the full path name of the specified inode */
+  static String getFullPathName(INode inode) {
+    // calculate the depth of this inode from root
+    int depth = 0;
+    for (INode i = inode; i != null; i = i.parent) {
+      depth++;
+    }
+    INode[] inodes = new INode[depth];
+
+    // fill up the inodes in the path from this inode to root
+    for (int i = 0; i < depth; i++) {
+      inodes[depth-i-1] = inode;
+      inode = inode.parent;
+    }
+    return getFullPathName(inodes, depth-1);
+  }
+  
   /**
    * Create a directory 
    * If ancestor directories do not exist, automatically create them.
@@ -940,9 +986,9 @@ class FSDirectory implements FSConstants, Closeable {
           return false;
         }
         // Directory creation also count towards FilesCreated
-        // to match count of files_deleted metric. 
+        // to match count of FilesDeleted metric. 
         if (namesystem != null)
-          NameNode.getNameNodeMetrics().numFilesCreated.inc();
+          NameNode.getNameNodeMetrics().incrNumFilesCreated();
         fsImage.getEditLog().logMkDir(cur, inodes[i]);
         NameNode.stateChangeLog.debug(
             "DIR* FSDirectory.mkdirs: created directory " + cur);
@@ -984,7 +1030,9 @@ class FSDirectory implements FSConstants, Closeable {
         long childDiskspace, boolean inheritPermission) 
   throws QuotaExceededException {
     byte[][] components = INode.getPathComponents(src);
-    child.setLocalName(components[components.length-1]);
+    byte[] path = components[components.length-1];
+    child.setLocalName(path);
+    cacheName(child);
     INode[] inodes = new INode[components.length];
     synchronized (rootDir) {
       rootDir.getExistingPathINodes(components, inodes);
@@ -1162,7 +1210,6 @@ class FSDirectory implements FSConstants, Closeable {
    * @param dir the root of the tree that represents the directory
    * @param counters counters for name space and disk space
    * @param nodesInPath INodes for the each of components in the path.
-   * @return the size of the tree
    */
   private static void updateCountForINodeWithQuota(INodeDirectory dir, 
                                                INode.DirCounts counts,
@@ -1244,6 +1291,8 @@ class FSDirectory implements FSConstants, Closeable {
       throw new FileNotFoundException("Directory does not exist: " + srcs);
     } else if (!targetNode.isDirectory()) {
       throw new FileNotFoundException("Cannot set quota on a file: " + srcs);  
+    } else if (targetNode.isRoot() && nsQuota == FSConstants.QUOTA_RESET) {
+      throw new IllegalArgumentException("Cannot clear namespace quota on root.");
     } else { // a directory inode
       INodeDirectory dirNode = (INodeDirectory)targetNode;
       long oldNsQuota = dirNode.getNsQuota();
@@ -1258,6 +1307,13 @@ class FSDirectory implements FSConstants, Closeable {
       if (dirNode instanceof INodeDirectoryWithQuota) { 
         // a directory with quota; so set the quota to the new value
         ((INodeDirectoryWithQuota)dirNode).setQuota(nsQuota, dsQuota);
+        if (!dirNode.isQuotaSet()) {
+          // will not come here for root because root's nsQuota is always set
+          INodeDirectory newNode = new INodeDirectory(dirNode);
+          INodeDirectory parent = (INodeDirectory)inodes[inodes.length-2];
+          dirNode = newNode;
+          parent.replaceChild(newNode);
+        }
       } else {
         // a non-quota directory; so replace it with a directory with quota
         INodeDirectoryWithQuota newNode = 
@@ -1334,9 +1390,10 @@ class FSDirectory implements FSConstants, Closeable {
   /**
    * Create FileStatus by file INode 
    */
-   private static FileStatus createFileStatus(String path, INode node) {
+   private static HdfsFileStatus createFileStatus(byte[] path, INode node) {
     // length is zero for directories
-    return new FileStatus(node.isDirectory() ? 0 : node.computeContentSummary().getLength(), 
+    return new HdfsFileStatus(
+        node.isDirectory() ? 0 : ((INodeFile)node).computeContentSummary().getLength(), 
         node.isDirectory(), 
         node.isDirectory() ? 0 : ((INodeFile)node).getReplication(), 
         node.isDirectory() ? 0 : ((INodeFile)node).getPreferredBlockSize(),
@@ -1345,6 +1402,22 @@ class FSDirectory implements FSConstants, Closeable {
         node.getFsPermission(),
         node.getUserName(),
         node.getGroupName(),
-        new Path(path));
+        path);
+  }
+  
+  /**
+   * Caches frequently used file names to reuse file name objects and
+   * reduce heap size.
+   */
+  void cacheName(INode inode) {
+    // Name is cached only for files
+    if (inode.isDirectory()) {
+      return;
+    }
+    ByteArray name = new ByteArray(inode.getLocalNameBytes());
+    name = nameCache.put(name);
+    if (name != null) {
+      inode.setLocalName(name.getBytes());
+    }
   }
 }
